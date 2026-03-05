@@ -36,12 +36,16 @@ pub async fn handle_request(
         } => handle_state(daemon, &session, wait_states, timeout).await,
         Request::Log {
             session,
-            all,
             follow: _,
             since,
             wait: do_wait,
             timeout,
-        } => handle_log(daemon, &session, all, since, do_wait, timeout).await,
+        } => handle_log(daemon, &session, since, do_wait, timeout).await,
+        Request::Next {
+            session,
+            wait: do_wait,
+            timeout,
+        } => handle_next(daemon, &session, do_wait, timeout).await,
         Request::Last { session } => handle_last(daemon, &session).await,
         Request::Act { session, actions } => handle_act(daemon, &session, &actions).await,
         Request::Screen { session, .. } => handle_screen(daemon, &session).await,
@@ -51,6 +55,7 @@ pub async fn handle_request(
         } => handle_expand(daemon, &session, &block_ids).await,
         Request::Gui { session } => handle_gui(daemon, &session).await,
         Request::Kill { session } => handle_kill(daemon, &session).await,
+        Request::KillAll => handle_killall(daemon).await,
         Request::GuiAttach { .. } => {
             // Should be handled by streaming handler
             err_json("GuiAttach must use streaming mode")
@@ -388,7 +393,6 @@ async fn handle_state(
 async fn handle_log(
     daemon: Arc<RwLock<Daemon>>,
     session_id: &str,
-    all: bool,
     since: Option<u64>,
     do_wait: bool,
     timeout: Option<f64>,
@@ -402,7 +406,6 @@ async fn handle_log(
     };
 
     if do_wait {
-        // Wait for idle/dead, then return all unread messages
         let timeout_dur = timeout.map(|s| Duration::from_secs_f64(s));
         let state_rx = {
             let s = session.lock().await;
@@ -418,7 +421,7 @@ async fn handle_log(
 
         let s = session.lock().await;
         let messages_path = s.log_writer.messages_path().to_path_buf();
-        let cursor = if all { 0 } else { s.read_cursor };
+        let cursor = since.unwrap_or(0);
         drop(s);
 
         let messages = match reader::read_since(&messages_path, cursor) {
@@ -426,46 +429,96 @@ async fn handle_log(
             Err(e) => return err_json(&format!("Failed to read log: {e}")),
         };
 
-        // Update cursor
-        if !all {
-            let mut s = session.lock().await;
-            if let Some(last) = messages.last() {
-                s.read_cursor = last.seq + 1;
-            }
-        }
-
-        let resp = serde_json::json!({
+        ok_json(serde_json::json!({
             "messages": messages,
             "_meta": {
                 "state": wait_result.state.to_string(),
                 "waited_sec": wait_result.waited_sec,
                 "timed_out": wait_result.timed_out,
             }
-        });
-
-        ok_json(resp)
+        }))
     } else {
-        // Immediate read
-        let mut s = session.lock().await;
+        let s = session.lock().await;
         let messages_path = s.log_writer.messages_path().to_path_buf();
-        let cursor = if all {
-            0
-        } else if let Some(since) = since {
-            since
-        } else {
-            s.read_cursor
-        };
+        let cursor = since.unwrap_or(0);
+        drop(s);
 
         let messages = match reader::read_since(&messages_path, cursor) {
             Ok(m) => m,
             Err(e) => return err_json(&format!("Failed to read log: {e}")),
         };
 
-        // Update cursor for default (unread) mode
-        if !all && since.is_none() {
-            if let Some(last) = messages.last() {
-                s.read_cursor = last.seq + 1;
+        let s = session.lock().await;
+        ok_json(serde_json::json!({
+            "messages": messages,
+            "_state": s.state.to_string(),
+        }))
+    }
+}
+
+async fn handle_next(
+    daemon: Arc<RwLock<Daemon>>,
+    session_id: &str,
+    do_wait: bool,
+    timeout: Option<f64>,
+) -> serde_json::Value {
+    let session = {
+        let d = daemon.read().await;
+        match d.resolve_session(session_id) {
+            Ok(s) => s,
+            Err(e) => return err_json(&e.to_string()),
+        }
+    };
+
+    if do_wait {
+        let timeout_dur = timeout.map(|s| Duration::from_secs_f64(s));
+        let state_rx = {
+            let s = session.lock().await;
+            s.state_rx.clone()
+        };
+
+        let wait_result = wait::wait_for_state(
+            state_rx,
+            &[SessionState::Idle, SessionState::Dead],
+            timeout_dur,
+        )
+        .await;
+
+        let s = session.lock().await;
+        let messages_path = s.log_writer.messages_path().to_path_buf();
+        let cursor = s.read_cursor;
+        drop(s);
+
+        let messages = match reader::read_since(&messages_path, cursor) {
+            Ok(m) => m,
+            Err(e) => return err_json(&format!("Failed to read log: {e}")),
+        };
+
+        let mut s = session.lock().await;
+        if let Some(last) = messages.last() {
+            s.read_cursor = last.seq + 1;
+        }
+
+        ok_json(serde_json::json!({
+            "messages": messages,
+            "_meta": {
+                "state": wait_result.state.to_string(),
+                "waited_sec": wait_result.waited_sec,
+                "timed_out": wait_result.timed_out,
             }
+        }))
+    } else {
+        let mut s = session.lock().await;
+        let messages_path = s.log_writer.messages_path().to_path_buf();
+        let cursor = s.read_cursor;
+
+        let messages = match reader::read_since(&messages_path, cursor) {
+            Ok(m) => m,
+            Err(e) => return err_json(&format!("Failed to read log: {e}")),
+        };
+
+        if let Some(last) = messages.last() {
+            s.read_cursor = last.seq + 1;
         }
 
         ok_json(serde_json::json!({
@@ -774,6 +827,49 @@ async fn kill_session(
         "ok": true,
         "codex_session_id": s.codex_session_id,
     }))
+}
+
+async fn handle_killall(
+    daemon: Arc<RwLock<Daemon>>,
+) -> serde_json::Value {
+    // Collect all active session IDs
+    let session_ids: Vec<String> = {
+        let d = daemon.read().await;
+        let mut ids = Vec::new();
+        for (id, session) in &d.sessions {
+            let s = session.lock().await;
+            if s.state != SessionState::Dead {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    };
+
+    let mut killed = Vec::new();
+    for id in &session_ids {
+        let session = {
+            let d = daemon.read().await;
+            match d.resolve_session(id) {
+                Ok(s) => s,
+                Err(_) => continue,
+            }
+        };
+
+        let result = kill_session(&session).await;
+        schedule_dead_session_cleanup(daemon.clone(), id.clone());
+
+        let codex_session_id = result
+            .get("codex_session_id")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        killed.push(serde_json::json!({
+            "session": id,
+            "codex_session_id": codex_session_id,
+        }));
+    }
+
+    ok_json(serde_json::json!({"ok": true, "killed": killed}))
 }
 
 async fn handle_gui_attach(

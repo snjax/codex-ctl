@@ -24,11 +24,16 @@ pub enum Request {
     Log {
         session: String,
         #[serde(default)]
-        all: bool,
-        #[serde(default)]
         follow: bool,
         #[serde(default)]
         since: Option<u64>,
+        #[serde(default)]
+        wait: bool,
+        #[serde(default)]
+        timeout: Option<f64>,
+    },
+    Next {
+        session: String,
         #[serde(default)]
         wait: bool,
         #[serde(default)]
@@ -58,6 +63,7 @@ pub enum Request {
     Kill {
         session: String,
     },
+    KillAll,
     GuiAttach {
         session: String,
     },

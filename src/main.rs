@@ -20,8 +20,8 @@ OpenAI Codex TUI sessions via PTY emulation. Designed for AI agents that \
 orchestrate Codex as a subprocess.\n\n\
 The daemon starts automatically on first invocation and listens on a Unix socket \
 at ~/.codex-ctl/daemon.sock (override with $CODEX_CTL_DIR).\n\n\
-All commands except `log` and `last` return JSON on stdout. \
-`log` and `last` return markdown-like text with a JSON status footer.\n\n\
+All commands except `log`, `next`, and `last` return JSON on stdout. \
+`log`, `next`, and `last` return markdown-like text with a JSON status footer.\n\n\
 Session IDs can be specified by unique prefix (like git/docker short IDs).\n\n\
 Exit codes: 0 = success, 1 = error (with {\"ok\":false,\"error\":\"...\"} on stdout).",
     after_help = "ENVIRONMENT:\n\
@@ -31,7 +31,8 @@ Exit codes: 0 = success, 1 = error (with {\"ok\":false,\"error\":\"...\"} on std
 EXAMPLES:\n\
   codex-ctl spawn \"fix auth bug\" --cwd ~/project\n\
   codex-ctl state a1b2 --wait --timeout 60\n\
-  codex-ctl log a1b2 --wait\n\
+  codex-ctl log a1b2\n\
+  codex-ctl next a1b2 --wait\n\
   codex-ctl act a1b2 down down enter\n\
   codex-ctl act a1b2 \"refactor the auth module\" enter\n\
   codex-ctl act a1b2 esc wait:500 \"new prompt\" enter\n\
@@ -113,19 +114,17 @@ When state is dead, the response includes exit_code.",
         timeout: Option<f64>,
     },
 
-    /// Read structured log messages from a session
+    /// Read all structured log messages from a session
     #[command(
-        long_about = "Output format: markdown-like plain text + JSON status footer.\n\
+        long_about = "Returns all log messages from session start. Output format: markdown-like \
+plain text + JSON status footer.\n\
 Blocks (file edits, command runs) are collapsed to one-line headers — \
 use `expand` to see full content.\n\n\
-By default reads only unread messages and advances the cursor. \
-Each session has one read cursor tracked by the daemon.\n\n\
-With --wait: blocks until IDLE/DEAD, then returns all accumulated messages \
-with a _meta footer containing waited_sec and timed_out.\n\n\
-With --follow: streams messages as NDJSON until the session dies (or client disconnects).",
+With --wait: blocks until IDLE/DEAD, then returns all messages.\n\n\
+With --follow: streams messages as NDJSON until the session dies.\n\n\
+Use `next` instead of `log` to read only unread messages with cursor tracking.",
         after_help = "EXAMPLES:\n\
-  codex-ctl log a1b2                    # unread messages\n\
-  codex-ctl log a1b2 --all              # all messages from start\n\
+  codex-ctl log a1b2                    # all messages from start\n\
   codex-ctl log a1b2 --since 42         # messages with seq >= 42\n\
   codex-ctl log a1b2 --wait             # block until done, return all\n\
   codex-ctl log a1b2 --wait --timeout 120\n\
@@ -135,19 +134,39 @@ With --follow: streams messages as NDJSON until the session dies (or client disc
         /// Session ID or unique prefix
         session: String,
 
-        /// Return all messages from the beginning (don't advance cursor)
-        #[arg(long)]
-        all: bool,
-
         /// Stream messages as NDJSON until session dies. Keeps connection open
-        #[arg(long, conflicts_with_all = ["all", "wait"])]
+        #[arg(long, conflicts_with = "wait")]
         follow: bool,
 
         /// Return messages with seq >= N
-        #[arg(long, conflicts_with = "all")]
+        #[arg(long)]
         since: Option<u64>,
 
-        /// Block until session reaches IDLE or DEAD, then return all accumulated messages
+        /// Block until session reaches IDLE or DEAD, then return all messages
+        #[arg(long)]
+        wait: bool,
+
+        /// Maximum seconds to wait (requires --wait)
+        #[arg(long, requires = "wait")]
+        timeout: Option<f64>,
+    },
+
+    /// Read unread log messages since last check (advances cursor)
+    #[command(
+        long_about = "Returns only messages not yet seen, advancing the read cursor. \
+Each session has one read cursor tracked by the daemon.\n\n\
+Ideal for supervisor loops: call `next` periodically to get incremental updates.\n\n\
+With --wait: blocks until IDLE/DEAD, then returns all unread messages.",
+        after_help = "EXAMPLES:\n\
+  codex-ctl next a1b2                   # unread messages since last check\n\
+  codex-ctl next a1b2 --wait            # block until done, return unread\n\
+  codex-ctl next a1b2 --wait --timeout 30"
+    )]
+    Next {
+        /// Session ID or unique prefix
+        session: String,
+
+        /// Block until session reaches IDLE or DEAD, then return unread messages
         #[arg(long)]
         wait: bool,
 
@@ -277,6 +296,15 @@ Returns: {\"ok\":true, \"codex_session_id\":\"<uuid>\" or null}",
         /// Session ID or unique prefix
         session: String,
     },
+
+    /// Kill all active sessions
+    #[command(
+        name = "killall",
+        long_about = "Gracefully terminates all active sessions. Each session goes through \
+the same kill sequence as `kill` (Ctrl+C x3 → SIGTERM → SIGKILL).\n\n\
+Returns: {\"ok\":true, \"killed\":[{\"session\":\"...\", \"codex_session_id\":\"...\"},...]}",
+    )]
+    KillAll,
 
     #[command(name = "_daemon", hide = true)]
     Daemon,
@@ -507,16 +535,23 @@ fn build_request(command: Commands) -> protocol::Request {
         }
         Commands::Log {
             session,
-            all,
             follow,
             since,
             wait,
             timeout,
         } => protocol::Request::Log {
             session,
-            all,
             follow,
             since,
+            wait,
+            timeout,
+        },
+        Commands::Next {
+            session,
+            wait,
+            timeout,
+        } => protocol::Request::Next {
+            session,
             wait,
             timeout,
         },
@@ -537,6 +572,7 @@ fn build_request(command: Commands) -> protocol::Request {
         },
         Commands::Gui { session } => protocol::Request::Gui { session },
         Commands::Kill { session } => protocol::Request::Kill { session },
+        Commands::KillAll => protocol::Request::KillAll,
         Commands::Daemon => unreachable!(),
         Commands::GuiAttach { session: _ } => unreachable!(),
     }
@@ -544,7 +580,7 @@ fn build_request(command: Commands) -> protocol::Request {
 
 fn format_output(request: &protocol::Request, response: &serde_json::Value) {
     match request {
-        protocol::Request::Log { .. } | protocol::Request::Last { .. } => {
+        protocol::Request::Log { .. } | protocol::Request::Next { .. } | protocol::Request::Last { .. } => {
             // Text format: markdown-like + JSON footer
             format_log_output(response);
         }

@@ -10,7 +10,7 @@ ID=$(codex-ctl spawn "fix the failing tests" --cwd ~/project | jq -r .session)
 codex-ctl state $ID --wait --timeout 120
 
 # Read the log
-codex-ctl log $ID --all
+codex-ctl log $ID
 ```
 
 ## Commands
@@ -69,16 +69,13 @@ Response examples:
 {"state":"dead","exit_code":0}
 ```
 
-### log --- read structured log messages
+### log --- read all log messages
 
 Output format: markdown-like plain text with a JSON status footer.
 
 ```bash
-# Unread messages only (advances cursor)
-codex-ctl log a1b2
-
 # All messages from start
-codex-ctl log a1b2 --all
+codex-ctl log a1b2
 
 # Messages with seq >= 42
 codex-ctl log a1b2 --since 42
@@ -88,6 +85,18 @@ codex-ctl log a1b2 --wait --timeout 120
 
 # Stream as NDJSON until session dies
 codex-ctl log a1b2 --follow
+```
+
+### next --- read unread messages (incremental)
+
+Reads only messages not yet seen, advancing the read cursor. Ideal for supervisor loops.
+
+```bash
+# Unread messages since last check
+codex-ctl next a1b2
+
+# Block until done, then return unread
+codex-ctl next a1b2 --wait --timeout 30
 ```
 
 ### act --- send keystrokes and text
@@ -152,6 +161,15 @@ codex-ctl kill a1b2
 
 The `codex_session_id` can be used with `spawn --resume` to continue the session later.
 
+### killall --- terminate all active sessions
+
+Kills all active sessions at once, returning each session's codex UUID.
+
+```bash
+codex-ctl killall
+# {"ok":true, "killed":[{"session":"a1b2c3d4","codex_session_id":"019c8826-..."},...]}
+```
+
 ## Usage patterns
 
 ### Pattern 1: Fire and forget
@@ -189,7 +207,7 @@ while true; do
     esac
 done
 
-codex-ctl log $ID --all
+codex-ctl log $ID
 ```
 
 ### Pattern 3: Interrupt and redirect
@@ -205,7 +223,7 @@ codex-ctl state $ID --wait idle --timeout 10
 # Give new instructions
 codex-ctl act $ID "focus only on src/ directory" enter
 codex-ctl state $ID --wait idle --timeout 120
-codex-ctl log $ID --all
+codex-ctl log $ID
 ```
 
 ### Pattern 4: Multiple parallel sessions
@@ -220,8 +238,8 @@ codex-ctl state $ID2 --wait --timeout 300 &
 wait
 
 # Read results
-codex-ctl log $ID1 --all
-codex-ctl log $ID2 --all
+codex-ctl log $ID1
+codex-ctl log $ID2
 ```
 
 ### Pattern 5: Resume after kill
@@ -247,7 +265,7 @@ Each Claude agent supervises a codex session via bash tool calls:
 ID=$(codex-ctl spawn "implement feature X" --cwd ~/project | jq -r .session)
 
 # Check progress periodically
-codex-ctl log $ID          # unread messages since last check
+codex-ctl next $ID          # unread messages since last check
 
 # React to prompts
 RESULT=$(codex-ctl state $ID --wait idle,prompting --timeout 30)
@@ -255,7 +273,7 @@ RESULT=$(codex-ctl state $ID --wait idle,prompting --timeout 30)
 codex-ctl act $ID down enter
 
 # Report to team lead
-codex-ctl log $ID --all    # full history for context
+codex-ctl log $ID          # full history for context
 ```
 
 ## Session data on disk
