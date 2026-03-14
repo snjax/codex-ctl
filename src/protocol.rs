@@ -12,6 +12,8 @@ pub enum Request {
         gui: bool,
         #[serde(default)]
         resume: Option<String>,
+        #[serde(default)]
+        opencode: bool,
     },
     List,
     State {
@@ -90,7 +92,7 @@ mod tests {
         let json = r#"{"cmd":"spawn","prompt":"hello","cwd":"/tmp","gui":false}"#;
         let req: Request = serde_json::from_str(json).unwrap();
         match req {
-            Request::Spawn { prompt, cwd, gui, resume } => {
+            Request::Spawn { prompt, cwd, gui, resume, .. } => {
                 assert_eq!(prompt.as_deref(), Some("hello"));
                 assert_eq!(cwd.as_deref(), Some("/tmp"));
                 assert!(!gui);

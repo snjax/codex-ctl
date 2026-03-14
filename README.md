@@ -1,13 +1,15 @@
 # codex-ctl
 
-CLI daemon for programmatically controlling [OpenAI Codex](https://github.com/openai/codex) TUI sessions via PTY + VT100 emulation.
+CLI daemon for programmatically controlling [OpenAI Codex](https://github.com/openai/codex) and [OpenCode](https://opencode.ai) sessions.
 
-Designed for AI agents that orchestrate Codex as a subprocess: spawn sessions, read structured logs, detect state transitions, answer prompts, send keystrokes --- all through simple shell commands returning JSON.
+Codex sessions use PTY + VT100 emulation. OpenCode sessions use structured JSON events (`opencode run --format json`).
+
+Designed for AI agents that orchestrate coding agents as subprocesses: spawn sessions, read structured logs, detect state transitions, answer prompts, send follow-ups --- all through simple shell commands returning JSON.
 
 ## Requirements
 
 - **Rust** 1.85+ (edition 2024)
-- **OpenAI Codex CLI** installed and available in `$PATH` (or set `CODEX_CTL_CODEX_PATH`)
+- **OpenAI Codex CLI** and/or **OpenCode** installed and available in `$PATH` (or set `CODEX_CTL_CODEX_PATH` / `CODEX_CTL_OPENCODE_PATH`)
 - **Linux** (PTY via `forkpty`, Unix sockets)
 - `OPENAI_API_KEY` set in environment (used by codex)
 
@@ -54,6 +56,7 @@ cargo test
 |---|---|---|
 | `CODEX_CTL_DIR` | `~/.codex-ctl` | Base directory for daemon socket, pid, session data |
 | `CODEX_CTL_CODEX_PATH` | `which codex` | Path to the codex binary |
+| `CODEX_CTL_OPENCODE_PATH` | `which opencode` | Path to the opencode binary |
 | `CODEX_CTL_TERMINAL` | auto-detect | Terminal emulator for `--gui` (foot, alacritty, kitty, xterm) |
 
 ## Architecture

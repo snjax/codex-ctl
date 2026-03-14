@@ -26,8 +26,12 @@ pub async fn handle_request(
     match request {
         Request::Ping => ok_json(serde_json::json!({"ok": true})),
         Request::List => handle_list(daemon).await,
-        Request::Spawn { prompt, cwd, gui, resume } => {
-            handle_spawn(daemon, prompt.as_deref(), cwd.as_deref(), gui, resume.as_deref()).await
+        Request::Spawn { prompt, cwd, gui, resume, opencode } => {
+            if opencode {
+                handle_spawn_opencode(daemon, prompt.as_deref(), cwd.as_deref()).await
+            } else {
+                handle_spawn(daemon, prompt.as_deref(), cwd.as_deref(), gui, resume.as_deref()).await
+            }
         }
         Request::State {
             session,
@@ -180,6 +184,109 @@ async fn handle_spawn(
 
     info!("Spawned session {session_id}, pid {pid}");
     ok_json(serde_json::json!({"ok": true, "session": session_id}))
+}
+
+async fn handle_spawn_opencode(
+    daemon: Arc<RwLock<Daemon>>,
+    prompt: Option<&str>,
+    cwd: Option<&str>,
+) -> serde_json::Value {
+    let prompt = match prompt {
+        Some(p) => p,
+        None => return err_json("Prompt is required for opencode spawn"),
+    };
+
+    let cwd = match cwd {
+        Some(c) => PathBuf::from(c),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+    };
+
+    let mut daemon_w = daemon.write().await;
+    let session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let session_dir = daemon_w.sessions_dir.join(&session_id);
+    if let Err(e) = std::fs::create_dir_all(&session_dir) {
+        return err_json(&format!("Failed to create session dir: {e}"));
+    }
+
+    let session = match Session::new_opencode(prompt, &cwd, &session_dir) {
+        Ok(s) => s,
+        Err(e) => return err_json(&format!("Failed to create session: {e}")),
+    };
+
+    let session_arc = Arc::new(tokio::sync::Mutex::new(session));
+    {
+        let mut s = session_arc.lock().await;
+        s.id = session_id.clone();
+        if let Err(e) = s.write_meta() {
+            error!("Failed to write session meta: {e}");
+        }
+    }
+
+    daemon_w.sessions.insert(session_id.clone(), session_arc.clone());
+    drop(daemon_w);
+
+    // Spawn opencode subprocess in background
+    let session_for_loop = session_arc.clone();
+    let cwd_clone = cwd.clone();
+    let prompt_owned = prompt.to_string();
+
+    tokio::spawn(async move {
+        opencode_run_loop(session_for_loop, &prompt_owned, &cwd_clone, None).await;
+        // Don't schedule cleanup — opencode sessions stay idle for act
+    });
+
+    info!("Spawned opencode session {session_id}");
+    ok_json(serde_json::json!({"ok": true, "session": session_id}))
+}
+
+/// Run a single `opencode run` subprocess and consume its events.
+/// When done, transitions the session to Idle.
+async fn opencode_run_loop(
+    session: Arc<tokio::sync::Mutex<Session>>,
+    prompt: &str,
+    cwd: &std::path::Path,
+    resume_sid: Option<&str>,
+) {
+    let mut child = match crate::session::opencode::spawn_opencode_run(prompt, cwd, resume_sid) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to spawn opencode: {e}");
+            let mut s = session.lock().await;
+            s.mark_dead(Some(1));
+            return;
+        }
+    };
+
+    // Consume NDJSON events, writing to session log
+    let result = crate::session::opencode::consume_events(&mut child, &session).await;
+
+    match result {
+        Ok((oc_sid, exit_code)) => {
+            let mut s = session.lock().await;
+            if let Some(sid) = oc_sid {
+                s.opencode_session_id = Some(sid);
+            }
+
+            // Transition to idle (not dead — opencode sessions can continue)
+            let old_state = s.state.to_string();
+            s.state = SessionState::Idle;
+            let _ = s.state_tx.send(SessionState::Idle);
+            let msg = crate::log::LogMessage::state_change(s.next_seq, &old_state, "idle");
+            s.next_seq += 1;
+            let _ = s.log_writer.append_message(&msg);
+            s.exit_code = exit_code;
+
+            info!(
+                "OpenCode session {} completed (exit={:?}, oc_sid={:?})",
+                s.id, exit_code, s.opencode_session_id
+            );
+        }
+        Err(e) => {
+            error!("OpenCode event consumption failed: {e}");
+            let mut s = session.lock().await;
+            s.mark_dead(Some(1));
+        }
+    }
 }
 
 /// PTY read loop: reads bytes from master fd, feeds to session, broadcasts.
@@ -568,11 +675,22 @@ async fn handle_act(
         }
     };
 
+    let (is_opencode, state) = {
+        let s = session.lock().await;
+        (s.is_opencode, s.state.clone())
+    };
+
+    if state == SessionState::Dead {
+        return err_json("Session is dead");
+    }
+
+    if is_opencode {
+        return handle_act_opencode(daemon, session, actions).await;
+    }
+
+    // Codex: send keystrokes via PTY
     let master_fd = {
         let s = session.lock().await;
-        if s.state == SessionState::Dead {
-            return err_json("Session is dead");
-        }
         s.master_fd
     };
 
@@ -583,6 +701,86 @@ async fn handle_act(
         Ok(()) => ok_json(serde_json::json!({"ok": true})),
         Err(e) => err_json(&format!("Failed to execute actions: {e}")),
     }
+}
+
+/// Handle `act` for opencode sessions: extract prompt from actions,
+/// wait for idle if working, then spawn a continuation subprocess.
+async fn handle_act_opencode(
+    _daemon: Arc<RwLock<Daemon>>,
+    session: Arc<tokio::sync::Mutex<Session>>,
+    actions: &[String],
+) -> serde_json::Value {
+    // For opencode, actions are treated as a prompt string
+    // (ignore keystrokes like "enter", "esc" — they don't apply)
+    let prompt: String = actions
+        .iter()
+        .filter(|a| {
+            let lower = a.to_lowercase();
+            !matches!(
+                lower.as_str(),
+                "enter" | "esc" | "tab" | "up" | "down" | "left" | "right"
+                    | "backspace" | "space" | "ctrl+c" | "ctrl+d"
+            ) && !lower.starts_with("wait:")
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if prompt.trim().is_empty() {
+        return err_json("No prompt text found in actions (opencode mode ignores keystrokes)");
+    }
+
+    // Wait for session to be idle if it's currently working
+    {
+        let s = session.lock().await;
+        if s.state == SessionState::Working {
+            let state_rx = s.state_rx.clone();
+            drop(s);
+            let _ = wait::wait_for_state(
+                state_rx,
+                &[SessionState::Idle, SessionState::Dead],
+                Some(Duration::from_secs(300)),
+            )
+            .await;
+
+            let s = session.lock().await;
+            if s.state == SessionState::Dead {
+                return err_json("Session died while waiting");
+            }
+        }
+    }
+
+    // Set state to Working
+    {
+        let mut s = session.lock().await;
+        let old_state = s.state.to_string();
+        s.state = SessionState::Working;
+        let _ = s.state_tx.send(SessionState::Working);
+        let msg = crate::log::LogMessage::state_change(s.next_seq, &old_state, "working");
+        s.next_seq += 1;
+        let _ = s.log_writer.append_message(&msg);
+    }
+
+    // Get opencode session ID and cwd for continuation
+    let (oc_sid, cwd) = {
+        let s = session.lock().await;
+        (s.opencode_session_id.clone(), s.cwd.clone())
+    };
+
+    // Spawn continuation in background
+    let session_for_loop = session.clone();
+
+    tokio::spawn(async move {
+        opencode_run_loop(
+            session_for_loop,
+            &prompt,
+            &cwd,
+            oc_sid.as_deref(),
+        )
+        .await;
+    });
+
+    ok_json(serde_json::json!({"ok": true}))
 }
 
 async fn handle_screen(
@@ -702,7 +900,16 @@ async fn handle_kill(
         }
     };
 
-    let result = kill_session(&session).await;
+    let is_opencode = {
+        let s = session.lock().await;
+        s.is_opencode
+    };
+
+    let result = if is_opencode {
+        kill_opencode_session(&session).await
+    } else {
+        kill_session(&session).await
+    };
 
     // Schedule cleanup (removes from daemon map + deletes session dir)
     schedule_dead_session_cleanup(daemon, session_id.to_string());
@@ -829,6 +1036,30 @@ async fn kill_session(
     }))
 }
 
+/// Kill an opencode session: just mark dead. The subprocess (if running) will
+/// be dropped when the session is cleaned up.
+async fn kill_opencode_session(
+    session: &Arc<tokio::sync::Mutex<Session>>,
+) -> serde_json::Value {
+    let mut s = session.lock().await;
+    if s.state == SessionState::Dead {
+        return ok_json(serde_json::json!({
+            "ok": true,
+            "codex_session_id": serde_json::Value::Null,
+            "opencode_session_id": s.opencode_session_id,
+        }));
+    }
+
+    let oc_sid = s.opencode_session_id.clone();
+    s.mark_dead(Some(0));
+
+    ok_json(serde_json::json!({
+        "ok": true,
+        "codex_session_id": serde_json::Value::Null,
+        "opencode_session_id": oc_sid,
+    }))
+}
+
 async fn handle_killall(
     daemon: Arc<RwLock<Daemon>>,
 ) -> serde_json::Value {
@@ -855,7 +1086,15 @@ async fn handle_killall(
             }
         };
 
-        let result = kill_session(&session).await;
+        let is_oc = {
+            let s = session.lock().await;
+            s.is_opencode
+        };
+        let result = if is_oc {
+            kill_opencode_session(&session).await
+        } else {
+            kill_session(&session).await
+        };
         schedule_dead_session_cleanup(daemon.clone(), id.clone());
 
         let codex_session_id = result

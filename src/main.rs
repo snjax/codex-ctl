@@ -75,6 +75,10 @@ Returns: {\"ok\":true, \"session\":\"<8-char-id>\"}",
         /// Resume a previous codex session by its UUID (from kill response's codex_session_id)
         #[arg(long)]
         resume: Option<String>,
+
+        /// Use OpenCode backend instead of Codex
+        #[arg(long)]
+        opencode: bool,
     },
 
     /// List all active sessions
@@ -510,12 +514,12 @@ async fn ensure_daemon() -> anyhow::Result<()> {
 
 fn build_request(command: Commands) -> protocol::Request {
     match command {
-        Commands::Spawn { prompt, cwd, gui, resume } => {
+        Commands::Spawn { prompt, cwd, gui, resume, opencode } => {
             if prompt.is_none() && resume.is_none() {
                 eprintln!("error: <PROMPT> is required unless --resume is specified");
                 std::process::exit(1);
             }
-            protocol::Request::Spawn { prompt, cwd, gui, resume }
+            protocol::Request::Spawn { prompt, cwd, gui, resume, opencode }
         }
         Commands::List => protocol::Request::List,
         Commands::State {

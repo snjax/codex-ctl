@@ -26,6 +26,7 @@ Options:
 - `--cwd <path>` --- working directory for codex (default: daemon's cwd)
 - `--gui` --- open a read-only terminal window showing live session output
 - `--resume <uuid>` --- resume a previous codex session by its UUID (from `kill` response)
+- `--opencode` --- use OpenCode backend instead of Codex
 
 ```bash
 # Spawn with GUI debug window
@@ -33,6 +34,9 @@ codex-ctl spawn "refactor auth" --cwd ~/project --gui
 
 # Resume a killed session
 codex-ctl spawn --resume 019c8826-8134-7183-be06-6f93dd6dd5e5
+
+# Spawn with OpenCode backend
+codex-ctl spawn --opencode "implement feature X" --cwd ~/project
 ```
 
 ### list --- show all active sessions
@@ -275,6 +279,34 @@ codex-ctl act $ID down enter
 # Report to team lead
 codex-ctl log $ID          # full history for context
 ```
+
+### OpenCode backend
+
+The `--opencode` flag uses OpenCode (`opencode run --format json`) instead of Codex. Sessions use structured JSON events instead of PTY parsing.
+
+```bash
+# Spawn
+ID=$(codex-ctl spawn --opencode "fix the tests" --cwd ~/project | jq -r .session)
+
+# Wait and read
+codex-ctl next $ID --wait --timeout 120
+
+# Follow up (act waits for idle, then sends continuation)
+codex-ctl act $ID "now add more test coverage"
+codex-ctl next $ID --wait --timeout 120
+
+# Full log
+codex-ctl log $ID
+```
+
+Differences from Codex:
+- `act` sends text as a new prompt (keystrokes like `enter`, `esc` are ignored)
+- `act` waits for idle before spawning continuation
+- OpenCode `build` agent auto-approves all tool calls (yolo mode)
+- Session continuations use `opencode run --continue --session <id>`
+- `list` shows `backend: "opencode"` and `opencode_session_id`
+
+Set `$CODEX_CTL_OPENCODE_PATH` to override the opencode binary location.
 
 ## Session data on disk
 
