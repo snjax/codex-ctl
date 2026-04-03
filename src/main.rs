@@ -107,7 +107,7 @@ When state is dead, the response includes exit_code.",
         /// Session ID or unique prefix
         session: String,
 
-        /// Block until reaching target state(s). Without a value: wait for idle or dead.
+        /// Block until reaching target state(s). Without a value: wait for idle, dead, or prompting.
         /// With comma-separated values: wait for any of the listed states
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         wait: Option<Option<String>>,
@@ -529,7 +529,7 @@ fn build_request(command: Commands) -> protocol::Request {
         } => {
             let wait_states = wait.map(|opt| {
                 opt.map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
-                    .unwrap_or_else(|| vec!["idle".into(), "dead".into()])
+                    .unwrap_or_else(|| vec!["idle".into(), "dead".into(), "prompting".into(), "prompting_notes".into()])
             });
             protocol::Request::State {
                 session,

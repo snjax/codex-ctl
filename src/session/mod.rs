@@ -82,6 +82,9 @@ pub struct Session {
     // Codex's own session UUID (captured from terminal output during graceful kill)
     pub codex_session_id: Option<String>,
 
+    // Auto-dismiss trust prompt (fires once)
+    pub trust_prompt_dismissed: bool,
+
     // OpenCode backend
     pub is_opencode: bool,
     pub opencode_session_id: Option<String>,
@@ -126,6 +129,7 @@ impl Session {
             exit_code: None,
             has_seen_esc: false,
             codex_session_id: None,
+            trust_prompt_dismissed: false,
             is_opencode: false,
             opencode_session_id: None,
         })
@@ -170,6 +174,7 @@ impl Session {
             exit_code: None,
             has_seen_esc: false,
             codex_session_id: None,
+            trust_prompt_dismissed: false,
             is_opencode: false,
             opencode_session_id: None,
         };
@@ -212,6 +217,7 @@ impl Session {
             exit_code: None,
             has_seen_esc: false,
             codex_session_id: None,
+            trust_prompt_dismissed: false,
             is_opencode: true,
             opencode_session_id: None,
         })
@@ -232,10 +238,14 @@ impl Session {
     }
 
     /// Process incoming PTY bytes.
-    pub fn on_pty_data(&mut self, data: &[u8]) {
+    /// Returns `true` if a trust prompt was detected and Enter should be sent.
+    pub fn on_pty_data(&mut self, data: &[u8]) -> bool {
         self.parser.process(data);
         let snapshot = take_snapshot(&self.parser);
         let filtered = filter_lines(&snapshot);
+
+        // Auto-dismiss trust directory prompt
+        let needs_enter = self.detect_trust_prompt(&filtered);
 
         // Instant state detection (no debounce)
         let now = Instant::now();
@@ -253,6 +263,26 @@ impl Session {
         // Feed stabilizer for log emission (stripped of UI chrome)
         let content_only = screen::strip_ui_chrome(&filtered);
         self.stabilizer.on_change(content_only);
+
+        needs_enter
+    }
+
+    /// Detect the codex "trust this directory?" prompt.
+    /// Returns true once per occurrence (won't fire repeatedly).
+    fn detect_trust_prompt(&mut self, lines: &[String]) -> bool {
+        if self.trust_prompt_dismissed {
+            return false;
+        }
+        let has_trust = lines.iter().any(|l| l.contains("Do you trust the contents of this directory"));
+        let has_continue = lines.iter().any(|l| {
+            l.contains("Yes, continue") || l.contains("Press enter to continue")
+        });
+        if has_trust && has_continue {
+            self.trust_prompt_dismissed = true;
+            true
+        } else {
+            false
+        }
     }
 
     /// Try to commit stable content and emit log messages.

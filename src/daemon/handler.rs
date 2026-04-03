@@ -342,7 +342,14 @@ async fn pty_read_loop(
                                 let _ = pty_broadcast.send(Bytes::copy_from_slice(data));
                                 // Feed session
                                 let mut s = session.lock().await;
-                                s.on_pty_data(data);
+                                let needs_enter = s.on_pty_data(data);
+                                if needs_enter {
+                                    // Auto-dismiss trust directory prompt
+                                    let master_fd = s.master_fd;
+                                    drop(s);
+                                    info!("Auto-dismissing trust directory prompt");
+                                    let _ = write_to_pty(master_fd, b"\r");
+                                }
                             }
                             Ok(Err(e)) => {
                                 error!("PTY read error: {e}");
@@ -432,7 +439,7 @@ async fn handle_state(
             .collect();
 
         let target = if target_states.is_empty() {
-            vec![SessionState::Idle, SessionState::Dead]
+            vec![SessionState::Idle, SessionState::Dead, SessionState::Prompting, SessionState::PromptingNotes]
         } else {
             target_states
         };
@@ -521,7 +528,7 @@ async fn handle_log(
 
         let wait_result = wait::wait_for_state(
             state_rx,
-            &[SessionState::Idle, SessionState::Dead],
+            &[SessionState::Idle, SessionState::Dead, SessionState::Prompting, SessionState::PromptingNotes],
             timeout_dur,
         )
         .await;
@@ -586,7 +593,7 @@ async fn handle_next(
 
         let wait_result = wait::wait_for_state(
             state_rx,
-            &[SessionState::Idle, SessionState::Dead],
+            &[SessionState::Idle, SessionState::Dead, SessionState::Prompting, SessionState::PromptingNotes],
             timeout_dur,
         )
         .await;
@@ -738,7 +745,7 @@ async fn handle_act_opencode(
             drop(s);
             let _ = wait::wait_for_state(
                 state_rx,
-                &[SessionState::Idle, SessionState::Dead],
+                &[SessionState::Idle, SessionState::Dead, SessionState::Prompting, SessionState::PromptingNotes],
                 Some(Duration::from_secs(300)),
             )
             .await;
