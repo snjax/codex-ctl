@@ -2,7 +2,7 @@
 
 ## Codex (via codex-ctl)
 
-`codex-ctl` — daemon + CLI for running OpenAI Codex sessions in background. Codex runs `--full-auto` in a PTY. Daemon auto-starts on `~/.codex-ctl/daemon.sock`.
+`codex-ctl` — daemon + CLI for running OpenAI Codex sessions in background. Codex runs with `--dangerously-bypass-approvals-and-sandbox` in a PTY. Daemon auto-starts on `~/.codex-ctl/daemon.sock`.
 
 Codex is an AI coding agent. Write prompts as specs — like Jira tickets for a thorough senior dev with zero initiative. It will implement exactly what the spec says, reliably and completely, but won't fill gaps or make creative leaps. If the spec is vague, the result will be vague.
 

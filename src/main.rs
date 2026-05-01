@@ -47,7 +47,7 @@ struct Cli {
 enum Commands {
     /// Launch a new Codex session under a PTY
     #[command(
-        long_about = "Forks codex --full-auto --no-alt-screen <PROMPT> under a PTY with a 500x200 virtual \
+        long_about = "Forks codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen <PROMPT> under a PTY with a 500x200 virtual \
 terminal. The session runs in the background, managed by the daemon.\n\n\
 With --resume <UUID>, resumes a previous codex session (from `codex resume <UUID>`).\n\
 The UUID is returned by the kill command as codex_session_id.\n\n\
@@ -60,7 +60,7 @@ Returns: {\"ok\":true, \"session\":\"<8-char-id>\"}",
   ID=$(codex-ctl spawn \"hello\" | jq -r .session)"
     )]
     Spawn {
-        /// The prompt to send to Codex (passed as `codex --full-auto <PROMPT>`).
+        /// The prompt to send to Codex (passed as `codex --dangerously-bypass-approvals-and-sandbox <PROMPT>`).
         /// Required unless --resume is specified.
         prompt: Option<String>,
 

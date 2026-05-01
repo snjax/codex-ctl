@@ -27,8 +27,10 @@ fn find_codex_binary() -> Result<String> {
 
 /// Spawn codex under a PTY with the given prompt and working directory.
 ///
-/// When `resume_id` is `Some(id)`, spawns `codex resume <id> --full-auto --no-alt-screen -C <cwd> [prompt]`.
-/// When `resume_id` is `None`, spawns `codex --full-auto --no-alt-screen -C <cwd> <prompt>`.
+/// When `resume_id` is `Some(id)`, spawns
+/// `codex resume <id> --dangerously-bypass-approvals-and-sandbox --no-alt-screen -C <cwd> [prompt]`.
+/// When `resume_id` is `None`, spawns
+/// `codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -C <cwd> <prompt>`.
 ///
 /// Returns the child PID and the master PTY fd (parent side).
 pub fn spawn_codex(prompt: Option<&str>, cwd: &Path, resume_id: Option<&str>) -> Result<SpawnResult> {
@@ -79,12 +81,12 @@ pub fn spawn_codex(prompt: Option<&str>, cwd: &Path, resume_id: Option<&str>) ->
             args.push(codex_c.clone());
 
             if let Some(id) = resume_id {
-                // codex resume <id> --full-auto --no-alt-screen -C <cwd> [prompt]
+                // codex resume <id> --dangerously-bypass-approvals-and-sandbox --no-alt-screen -C <cwd> [prompt]
                 args.push(CString::new("resume").unwrap());
                 args.push(CString::new(id).unwrap());
             }
 
-            args.push(CString::new("--full-auto").unwrap());
+            args.push(CString::new("--dangerously-bypass-approvals-and-sandbox").unwrap());
             args.push(CString::new("--no-alt-screen").unwrap());
             args.push(CString::new("-C").unwrap());
             args.push(CString::new(cwd_str.as_ref()).unwrap());
