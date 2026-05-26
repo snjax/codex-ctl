@@ -15,17 +15,12 @@ pub struct SpawnResult {
     pub master_fd: OwnedFd,
 }
 
-/// Find the codex binary path.
-fn find_codex_binary() -> Result<String> {
-    if let Ok(path) = std::env::var("CODEX_CTL_CODEX_PATH") {
-        return Ok(path);
-    }
-    let path = which::which("codex")
-        .context("Cannot find 'codex' in PATH. Set $CODEX_CTL_CODEX_PATH.")?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
 /// Spawn codex under a PTY with the given prompt and working directory.
+///
+/// `codex_path` is the absolute path to the codex binary, resolved by the
+/// client and forwarded through the Spawn request. The daemon must not
+/// resolve `codex` itself — its long-lived `PATH` may be missing the dir
+/// where the user installed codex (e.g. nvm's bin).
 ///
 /// When `resume_id` is `Some(id)`, spawns
 /// `codex resume <id> --dangerously-bypass-approvals-and-sandbox --no-alt-screen -C <cwd> [prompt]`.
@@ -33,15 +28,18 @@ fn find_codex_binary() -> Result<String> {
 /// `codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -C <cwd> <prompt>`.
 ///
 /// Returns the child PID and the master PTY fd (parent side).
-pub fn spawn_codex(prompt: Option<&str>, cwd: &Path, resume_id: Option<&str>) -> Result<SpawnResult> {
+pub fn spawn_codex(
+    codex_path: &str,
+    prompt: Option<&str>,
+    cwd: &Path,
+    resume_id: Option<&str>,
+) -> Result<SpawnResult> {
     let winsize = Winsize {
         ws_row: PTY_ROWS,
         ws_col: PTY_COLS,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-
-    let codex_path = find_codex_binary()?;
 
     // Safety: forkpty is an unsafe FFI call that forks the process.
     // After fork, the child must only call async-signal-safe functions
@@ -73,7 +71,7 @@ pub fn spawn_codex(prompt: Option<&str>, cwd: &Path, resume_id: Option<&str>) ->
                 std::process::exit(1);
             }
 
-            let codex_c = CString::new(codex_path.as_str()).unwrap();
+            let codex_c = CString::new(codex_path).unwrap();
             let cwd_str = cwd.to_string_lossy();
 
             // Build args depending on resume mode

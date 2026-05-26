@@ -26,11 +26,11 @@ pub async fn handle_request(
     match request {
         Request::Ping => ok_json(serde_json::json!({"ok": true})),
         Request::List => handle_list(daemon).await,
-        Request::Spawn { prompt, cwd, gui, resume, opencode } => {
+        Request::Spawn { binary_path, prompt, cwd, gui, resume, opencode } => {
             if opencode {
-                handle_spawn_opencode(daemon, prompt.as_deref(), cwd.as_deref()).await
+                handle_spawn_opencode(daemon, &binary_path, prompt.as_deref(), cwd.as_deref()).await
             } else {
-                handle_spawn(daemon, prompt.as_deref(), cwd.as_deref(), gui, resume.as_deref()).await
+                handle_spawn(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), gui, resume.as_deref()).await
             }
         }
         Request::State {
@@ -108,6 +108,7 @@ async fn handle_list(daemon: Arc<RwLock<Daemon>>) -> serde_json::Value {
 
 async fn handle_spawn(
     daemon: Arc<RwLock<Daemon>>,
+    codex_path: &str,
     prompt: Option<&str>,
     cwd: Option<&str>,
     gui: bool,
@@ -119,7 +120,7 @@ async fn handle_spawn(
     };
 
     // Spawn codex under PTY
-    let spawn_result = match crate::session::pty::spawn_codex(prompt, &cwd, resume) {
+    let spawn_result = match crate::session::pty::spawn_codex(codex_path, prompt, &cwd, resume) {
         Ok(r) => r,
         Err(e) => return err_json(&format!("Failed to spawn codex: {e}")),
     };
@@ -188,6 +189,7 @@ async fn handle_spawn(
 
 async fn handle_spawn_opencode(
     daemon: Arc<RwLock<Daemon>>,
+    binary_path: &str,
     prompt: Option<&str>,
     cwd: Option<&str>,
 ) -> serde_json::Value {
@@ -208,7 +210,7 @@ async fn handle_spawn_opencode(
         return err_json(&format!("Failed to create session dir: {e}"));
     }
 
-    let session = match Session::new_opencode(prompt, &cwd, &session_dir) {
+    let session = match Session::new_opencode(binary_path, prompt, &cwd, &session_dir) {
         Ok(s) => s,
         Err(e) => return err_json(&format!("Failed to create session: {e}")),
     };
@@ -229,9 +231,10 @@ async fn handle_spawn_opencode(
     let session_for_loop = session_arc.clone();
     let cwd_clone = cwd.clone();
     let prompt_owned = prompt.to_string();
+    let binary_owned = binary_path.to_string();
 
     tokio::spawn(async move {
-        opencode_run_loop(session_for_loop, &prompt_owned, &cwd_clone, None).await;
+        opencode_run_loop(session_for_loop, &binary_owned, &prompt_owned, &cwd_clone, None).await;
         // Don't schedule cleanup — opencode sessions stay idle for act
     });
 
@@ -243,11 +246,12 @@ async fn handle_spawn_opencode(
 /// When done, transitions the session to Idle.
 async fn opencode_run_loop(
     session: Arc<tokio::sync::Mutex<Session>>,
+    binary: &str,
     prompt: &str,
     cwd: &std::path::Path,
     resume_sid: Option<&str>,
 ) {
-    let mut child = match crate::session::opencode::spawn_opencode_run(prompt, cwd, resume_sid) {
+    let mut child = match crate::session::opencode::spawn_opencode_run(binary, prompt, cwd, resume_sid) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to spawn opencode: {e}");
@@ -768,10 +772,19 @@ async fn handle_act_opencode(
         let _ = s.log_writer.append_message(&msg);
     }
 
-    // Get opencode session ID and cwd for continuation
-    let (oc_sid, cwd) = {
+    // Get opencode session ID, cwd, and binary path for continuation
+    let (oc_sid, cwd, binary) = {
         let s = session.lock().await;
-        (s.opencode_session_id.clone(), s.cwd.clone())
+        (
+            s.opencode_session_id.clone(),
+            s.cwd.clone(),
+            s.opencode_binary.clone(),
+        )
+    };
+
+    let binary = match binary {
+        Some(b) => b,
+        None => return err_json("Opencode session has no recorded binary path (was it spawned before this fix?)"),
     };
 
     // Spawn continuation in background
@@ -780,6 +793,7 @@ async fn handle_act_opencode(
     tokio::spawn(async move {
         opencode_run_loop(
             session_for_loop,
+            &binary,
             &prompt,
             &cwd,
             oc_sid.as_deref(),

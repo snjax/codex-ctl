@@ -11,24 +11,17 @@ use tokio::process::{Child, Command};
 use crate::log::LogMessage;
 use crate::parser::blocks::Block;
 
-/// Find the opencode binary.
-fn find_opencode_binary() -> Result<String> {
-    if let Ok(path) = std::env::var("CODEX_CTL_OPENCODE_PATH") {
-        return Ok(path);
-    }
-    let path = which::which("opencode")
-        .context("Cannot find 'opencode' in PATH. Set $CODEX_CTL_OPENCODE_PATH.")?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
 /// Spawn `opencode run --format json` as a subprocess.
+///
+/// `binary` is the absolute path to opencode, resolved by the client.
+/// See `spawn_codex` for why the daemon must not resolve this itself.
 pub fn spawn_opencode_run(
+    binary: &str,
     prompt: &str,
     cwd: &Path,
     session_id: Option<&str>,
 ) -> Result<Child> {
-    let binary = find_opencode_binary()?;
-    let mut cmd = Command::new(&binary);
+    let mut cmd = Command::new(binary);
     cmd.arg("run");
     cmd.arg("--format").arg("json");
     cmd.arg("--dir").arg(cwd);

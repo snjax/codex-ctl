@@ -512,6 +512,24 @@ async fn ensure_daemon() -> anyhow::Result<()> {
     anyhow::bail!("Daemon failed to start within 2 seconds")
 }
 
+/// Resolve the backend binary using the client's PATH so the daemon doesn't
+/// have to. The daemon's PATH is whatever leaked in at daemon-startup time
+/// and can easily lack nvm/cargo/bun dirs where the user installed codex or
+/// opencode — resolving here means failure is per-call and recoverable.
+fn resolve_backend_binary(opencode: bool) -> Result<String, String> {
+    let (env_var, name) = if opencode {
+        ("CODEX_CTL_OPENCODE_PATH", "opencode")
+    } else {
+        ("CODEX_CTL_CODEX_PATH", "codex")
+    };
+    if let Ok(p) = std::env::var(env_var) {
+        return Ok(p);
+    }
+    which::which(name)
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| format!("Cannot find '{name}' in PATH ({e}). Set ${env_var}."))
+}
+
 fn build_request(command: Commands) -> protocol::Request {
     match command {
         Commands::Spawn { prompt, cwd, gui, resume, opencode } => {
@@ -519,7 +537,14 @@ fn build_request(command: Commands) -> protocol::Request {
                 eprintln!("error: <PROMPT> is required unless --resume is specified");
                 std::process::exit(1);
             }
-            protocol::Request::Spawn { prompt, cwd, gui, resume, opencode }
+            let binary_path = match resolve_backend_binary(opencode) {
+                Ok(p) => p,
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    std::process::exit(1);
+                }
+            };
+            protocol::Request::Spawn { binary_path, prompt, cwd, gui, resume, opencode }
         }
         Commands::List => protocol::Request::List,
         Commands::State {

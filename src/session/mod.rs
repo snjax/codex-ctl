@@ -88,6 +88,10 @@ pub struct Session {
     // OpenCode backend
     pub is_opencode: bool,
     pub opencode_session_id: Option<String>,
+    /// Absolute path to the opencode binary, captured at spawn time so
+    /// follow-up `act` requests can re-spawn `opencode run --continue`
+    /// without needing the daemon to re-resolve `opencode` in its own PATH.
+    pub opencode_binary: Option<String>,
 }
 
 impl Session {
@@ -132,6 +136,7 @@ impl Session {
             trust_prompt_dismissed: false,
             is_opencode: false,
             opencode_session_id: None,
+            opencode_binary: None,
         })
     }
 
@@ -177,12 +182,14 @@ impl Session {
             trust_prompt_dismissed: false,
             is_opencode: false,
             opencode_session_id: None,
+            opencode_binary: None,
         };
         Ok((session, spawn_result.master_fd))
     }
 
     /// Create an OpenCode session (no PTY — uses subprocess with piped stdout).
     pub fn new_opencode(
+        binary: &str,
         prompt: &str,
         cwd: &Path,
         session_dir: &Path,
@@ -220,6 +227,7 @@ impl Session {
             trust_prompt_dismissed: false,
             is_opencode: true,
             opencode_session_id: None,
+            opencode_binary: Some(binary.to_string()),
         })
     }
 

@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Spawn {
+        /// Absolute path to the backend binary (codex or opencode), resolved
+        /// by the client using the client's PATH. The daemon execs this path
+        /// directly so its own PATH is irrelevant.
+        binary_path: String,
         #[serde(default)]
         prompt: Option<String>,
         #[serde(default)]
@@ -89,10 +93,11 @@ mod tests {
 
     #[test]
     fn test_request_serde_roundtrip_spawn() {
-        let json = r#"{"cmd":"spawn","prompt":"hello","cwd":"/tmp","gui":false}"#;
+        let json = r#"{"cmd":"spawn","binary_path":"/usr/bin/codex","prompt":"hello","cwd":"/tmp","gui":false}"#;
         let req: Request = serde_json::from_str(json).unwrap();
         match req {
-            Request::Spawn { prompt, cwd, gui, resume, .. } => {
+            Request::Spawn { binary_path, prompt, cwd, gui, resume, .. } => {
+                assert_eq!(binary_path, "/usr/bin/codex");
                 assert_eq!(prompt.as_deref(), Some("hello"));
                 assert_eq!(cwd.as_deref(), Some("/tmp"));
                 assert!(!gui);
@@ -104,10 +109,11 @@ mod tests {
 
     #[test]
     fn test_request_serde_roundtrip_spawn_with_resume() {
-        let json = r#"{"cmd":"spawn","resume":"019c8826-8134-7183-be06-6f93dd6dd5e5","prompt":"continue","cwd":"/tmp"}"#;
+        let json = r#"{"cmd":"spawn","binary_path":"/usr/bin/codex","resume":"019c8826-8134-7183-be06-6f93dd6dd5e5","prompt":"continue","cwd":"/tmp"}"#;
         let req: Request = serde_json::from_str(json).unwrap();
         match req {
-            Request::Spawn { prompt, cwd, resume, .. } => {
+            Request::Spawn { binary_path, prompt, cwd, resume, .. } => {
+                assert_eq!(binary_path, "/usr/bin/codex");
                 assert_eq!(prompt.as_deref(), Some("continue"));
                 assert_eq!(cwd.as_deref(), Some("/tmp"));
                 assert_eq!(resume.as_deref(), Some("019c8826-8134-7183-be06-6f93dd6dd5e5"));
@@ -118,15 +124,24 @@ mod tests {
 
     #[test]
     fn test_request_serde_roundtrip_spawn_resume_no_prompt() {
-        let json = r#"{"cmd":"spawn","resume":"019c8826-8134-7183-be06-6f93dd6dd5e5"}"#;
+        let json = r#"{"cmd":"spawn","binary_path":"/usr/bin/codex","resume":"019c8826-8134-7183-be06-6f93dd6dd5e5"}"#;
         let req: Request = serde_json::from_str(json).unwrap();
         match req {
-            Request::Spawn { prompt, resume, .. } => {
+            Request::Spawn { binary_path, prompt, resume, .. } => {
+                assert_eq!(binary_path, "/usr/bin/codex");
                 assert!(prompt.is_none());
                 assert_eq!(resume.as_deref(), Some("019c8826-8134-7183-be06-6f93dd6dd5e5"));
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_request_spawn_rejects_missing_binary_path() {
+        // Without binary_path the request must fail to deserialize so that
+        // pre-fix clients fail loudly instead of silently breaking.
+        let json = r#"{"cmd":"spawn","prompt":"hello","cwd":"/tmp"}"#;
+        assert!(serde_json::from_str::<Request>(json).is_err());
     }
 
     #[test]
