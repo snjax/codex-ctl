@@ -39,26 +39,6 @@ pub fn read_unread(path: &Path, cursor: u64) -> Result<(Vec<LogMessage>, u64)> {
     Ok((messages, new_cursor))
 }
 
-/// Read blocks from blocks.jsonl.
-#[allow(dead_code)]
-pub fn read_blocks(path: &Path) -> Result<Vec<crate::parser::blocks::Block>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut blocks = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let block: crate::parser::blocks::Block = serde_json::from_str(&line)?;
-        blocks.push(block);
-    }
-    Ok(blocks)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

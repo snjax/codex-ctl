@@ -9,7 +9,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::log::LogMessage;
-use crate::parser::blocks::Block;
 
 /// Spawn `opencode run --format json` as a subprocess.
 ///
@@ -250,7 +249,8 @@ fn process_event(
     }
 }
 
-/// Helper: emit a block + log message.
+/// Streams body to `bodies.bin` and records metadata in memory + the message
+/// log. Body bytes are not retained.
 fn emit_block(
     s: &mut super::Session,
     bid: u64,
@@ -258,16 +258,7 @@ fn emit_block(
     header: &str,
     body: Vec<String>,
 ) {
-    let block = Block {
-        id: bid,
-        block_type: block_type.to_string(),
-        header: header.to_string(),
-        body: body.clone(),
-        seq: s.next_seq,
-    };
-    let msg = LogMessage::block(s.next_seq, header, bid, block_type, body.len() as u32);
+    let seq = s.next_seq;
     s.next_seq += 1;
-    let _ = s.log_writer.append_message(&msg);
-    let _ = s.log_writer.append_block(&block);
-    s.blocks.insert(bid, block);
+    super::emit_block_to_disk(s, bid, seq, block_type, header, &body);
 }

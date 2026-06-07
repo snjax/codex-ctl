@@ -834,27 +834,64 @@ async fn handle_expand(
         }
     };
 
-    let s = session.lock().await;
+    // Snapshot the metadata under the session lock, plus flush the body
+    // BufWriter so the offsets we're about to read are all backed by file
+    // bytes. Then drop the lock before doing any disk reads — we don't want
+    // to hold the session mutex while a multi-MB body is pread'd from disk.
+    let (selected, bodies_path) = {
+        let mut s = session.lock().await;
+        let _ = s.log_writer.flush_all();
+        let bodies_path = s.log_writer.bodies_path().to_path_buf();
 
-    let mut result_blocks = Vec::new();
-
-    if block_ids.len() == 1 && block_ids[0] == "--all" {
-        // Return all blocks
-        for block in s.blocks.values() {
-            result_blocks.push(serde_json::json!(block));
-        }
-    } else {
-        for id_str in block_ids {
-            // Support comma-separated IDs
-            for part in id_str.split(',') {
-                let part = part.trim();
-                if let Ok(id) = part.parse::<u64>() {
-                    if let Some(block) = s.blocks.get(&id) {
-                        result_blocks.push(serde_json::json!(block));
+        let mut selected: Vec<crate::session::BlockMeta> = Vec::new();
+        if block_ids.len() == 1 && block_ids[0] == "--all" {
+            selected.extend(s.blocks.values().cloned());
+            selected.sort_by_key(|m| m.id);
+        } else {
+            for id_str in block_ids {
+                for part in id_str.split(',') {
+                    let part = part.trim();
+                    if let Ok(id) = part.parse::<u64>() {
+                        if let Some(meta) = s.blocks.get(&id) {
+                            selected.push(meta.clone());
+                        }
                     }
                 }
             }
         }
+        (selected, bodies_path)
+    };
+
+    // Open bodies.bin once for the whole expand, then seek+read per block.
+    // One open() + N pread-equivalents instead of N opens — cheap even for
+    // `--all` on a multi-thousand-block session.
+    let mut file = match std::fs::File::open(&bodies_path) {
+        Ok(f) => f,
+        Err(e) => return err_json(&format!("Failed to open bodies.bin: {e}")),
+    };
+
+    use std::io::{Read, Seek, SeekFrom};
+    let mut result_blocks = Vec::new();
+    for meta in &selected {
+        let mut buf = vec![0u8; meta.body_len as usize];
+        if meta.body_len > 0 {
+            if let Err(e) = file.seek(SeekFrom::Start(meta.body_offset)) {
+                tracing::error!("Failed to seek in bodies.bin for block {}: {e}", meta.id);
+                continue;
+            }
+            if let Err(e) = file.read_exact(&mut buf) {
+                tracing::error!("Failed to read body for block {}: {e}", meta.id);
+                continue;
+            }
+        }
+        let body = crate::session::decode_body(&buf);
+        result_blocks.push(serde_json::json!({
+            "id": meta.id,
+            "block_type": meta.block_type,
+            "header": meta.header,
+            "body": body,
+            "seq": meta.seq,
+        }));
     }
 
     ok_json(serde_json::json!({"ok": true, "blocks": result_blocks}))

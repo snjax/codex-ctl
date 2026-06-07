@@ -19,11 +19,25 @@ use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 use crate::log::{LogMessage, LogWriter};
-use crate::parser::blocks::{self, Block};
+use crate::parser::blocks;
 use crate::parser::classifier;
 use crate::session::screen::{compute_diff, filter_lines, take_snapshot};
 use crate::session::stabilizer::Stabilizer;
 use crate::session::state::{DetectedState, SessionState, detect_state};
+
+/// In-memory index entry for a block whose body has been streamed to
+/// `bodies.bin`. Small fixed size (~header bytes + tag string) so the index
+/// stays cheap even for sessions with tens of thousands of blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockMeta {
+    pub id: u64,
+    pub block_type: String,
+    pub header: String,
+    pub seq: u64,
+    pub body_offset: u64,
+    pub body_len: u64,
+    pub body_lines: u32,
+}
 
 /// Metadata written to disk for each session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,9 +72,12 @@ pub struct Session {
     pub stabilizer: Stabilizer,
     pub stable_snapshot: Vec<String>,
 
-    // Blocks
+    // Blocks: metadata only — bodies live in bodies.bin and are read on demand
+    // by `handle_expand` via pread at body_offset/body_len. Keeping bodies in
+    // RAM was the dominant source of unbounded daemon growth on heavy agent
+    // workloads.
     pub next_block_id: u64,
-    pub blocks: HashMap<u64, Block>,
+    pub blocks: HashMap<u64, BlockMeta>,
 
     // PTY broadcast for GUI
     pub pty_broadcast: broadcast::Sender<Bytes>,
@@ -315,6 +332,11 @@ impl Session {
             detected.state = SessionState::Working;
         }
         self.update_state(detected);
+
+        // Cheap (a couple of write() syscalls); makes live `log`/`next`
+        // readers see fresh data within ~50 ms while letting BufWriter batch
+        // the per-event writes.
+        let _ = self.log_writer.flush_all();
     }
 
     fn commit(&mut self, new_snapshot: Vec<String>) {
@@ -323,24 +345,14 @@ impl Session {
             let detected_blocks = blocks::detect_blocks(&diff);
             let remaining = blocks::extract_non_block_text(&diff, &detected_blocks);
 
-            // Emit blocks
-            for mut block in detected_blocks {
-                block.id = self.next_block_id;
+            // Emit blocks: body bytes go to bodies.bin, only metadata stays
+            // in RAM. emit_block_to_disk handles the dance.
+            for block in detected_blocks {
+                let id = self.next_block_id;
                 self.next_block_id += 1;
-                block.seq = self.next_seq;
-
-                let body_lines = block.body.len() as u32;
-                let msg = LogMessage::block(
-                    self.next_seq,
-                    &block.header,
-                    block.id,
-                    &block.block_type,
-                    body_lines,
-                );
+                let seq = self.next_seq;
                 self.next_seq += 1;
-                let _ = self.log_writer.append_message(&msg);
-                let _ = self.log_writer.append_block(&block);
-                self.blocks.insert(block.id, block);
+                emit_block_to_disk(self, id, seq, &block.block_type, &block.header, &block.body);
             }
 
             // Emit remaining text
@@ -434,5 +446,110 @@ impl Session {
             info["backend"] = serde_json::json!("codex");
         }
         info
+    }
+}
+
+/// Encode a block body as the bytes that will live in `bodies.bin`. Lines are
+/// joined with `\n`; the decode side splits on the same delimiter. Inputs
+/// always come from `str::lines()`, so individual entries can never contain
+/// `\n` themselves — the round-trip is lossless.
+pub fn encode_body(body: &[String]) -> Vec<u8> {
+    body.join("\n").into_bytes()
+}
+
+/// Inverse of `encode_body`. Empty input yields an empty Vec (rather than
+/// `[""]`, which would lie about the line count).
+pub fn decode_body(bytes: &[u8]) -> Vec<String> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    // from_utf8_lossy is fine here: bodies are agent-emitted text and we'd
+    // rather show U+FFFD than fail an expand request.
+    String::from_utf8_lossy(bytes)
+        .split('\n')
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Write a block's body to `bodies.bin`, emit its `block` message to
+/// `messages.jsonl`, and insert metadata into the in-memory index. Body
+/// itself is not retained in RAM — `body` is borrowed and dropped by the
+/// caller.
+///
+/// Shared by codex (PTY parser) and opencode (NDJSON tool events) so both
+/// paths cannot drift on storage policy.
+pub fn emit_block_to_disk(
+    s: &mut Session,
+    block_id: u64,
+    seq: u64,
+    block_type: &str,
+    header: &str,
+    body: &[String],
+) {
+    let bytes = encode_body(body);
+    let body_len = bytes.len() as u64;
+    let body_lines = body.len() as u32;
+
+    let body_offset = match s.log_writer.append_body(&bytes) {
+        Ok(off) => off,
+        Err(e) => {
+            tracing::error!("Failed to append body for block {block_id}: {e}");
+            return;
+        }
+    };
+
+    let msg = LogMessage::block(seq, header, block_id, block_type, body_lines, body_offset, body_len);
+    let _ = s.log_writer.append_message(&msg);
+
+    s.blocks.insert(
+        block_id,
+        BlockMeta {
+            id: block_id,
+            block_type: block_type.to_string(),
+            header: header.to_string(),
+            seq,
+            body_offset,
+            body_len,
+            body_lines,
+        },
+    );
+}
+
+#[cfg(test)]
+mod body_codec_tests {
+    use super::{decode_body, encode_body};
+
+    #[test]
+    fn round_trip_basic() {
+        let body = vec!["line one".to_string(), "line two".to_string(), "".to_string()];
+        let bytes = encode_body(&body);
+        assert_eq!(bytes, b"line one\nline two\n");
+        assert_eq!(decode_body(&bytes), body);
+    }
+
+    #[test]
+    fn empty_body_is_empty_bytes() {
+        let body: Vec<String> = Vec::new();
+        let bytes = encode_body(&body);
+        assert!(bytes.is_empty());
+        assert!(decode_body(&bytes).is_empty());
+    }
+
+    #[test]
+    fn single_line_no_trailing_newline() {
+        let body = vec!["just one".to_string()];
+        let bytes = encode_body(&body);
+        assert_eq!(bytes, b"just one");
+        assert_eq!(decode_body(&bytes), body);
+    }
+
+    #[test]
+    fn binary_garbage_decodes_lossy_without_panic() {
+        // Bodies must always decode — a malformed sequence becomes U+FFFD
+        // rather than failing the expand request for the rest of the run.
+        let bytes = vec![b'h', b'i', 0xff, 0xfe, b'\n', b'k'];
+        let decoded = decode_body(&bytes);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[1], "k");
     }
 }

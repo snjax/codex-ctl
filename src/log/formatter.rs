@@ -88,6 +88,8 @@ mod tests {
             1,
             "edited",
             5,
+            0,
+            0,
         )];
         let lines = format_messages(&messages);
         assert_eq!(lines, vec!["### Edited file.rs (+2 -1)"]);
