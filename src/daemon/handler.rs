@@ -537,7 +537,12 @@ async fn handle_log(
         )
         .await;
 
-        let s = session.lock().await;
+        let mut s = session.lock().await;
+        // Force pending BufWriter content to disk before reading. Codex
+        // sessions also flush from `tick()` every ~50ms, but opencode
+        // sessions have no tick — without this, messages.jsonl can stay
+        // empty for the entire run.
+        let _ = s.log_writer.flush_all();
         let messages_path = s.log_writer.messages_path().to_path_buf();
         let cursor = since.unwrap_or(0);
         drop(s);
@@ -556,7 +561,8 @@ async fn handle_log(
             }
         }))
     } else {
-        let s = session.lock().await;
+        let mut s = session.lock().await;
+        let _ = s.log_writer.flush_all();
         let messages_path = s.log_writer.messages_path().to_path_buf();
         let cursor = since.unwrap_or(0);
         drop(s);
@@ -602,7 +608,8 @@ async fn handle_next(
         )
         .await;
 
-        let s = session.lock().await;
+        let mut s = session.lock().await;
+        let _ = s.log_writer.flush_all();
         let messages_path = s.log_writer.messages_path().to_path_buf();
         let cursor = s.read_cursor;
         drop(s);
@@ -627,6 +634,7 @@ async fn handle_next(
         }))
     } else {
         let mut s = session.lock().await;
+        let _ = s.log_writer.flush_all();
         let messages_path = s.log_writer.messages_path().to_path_buf();
         let cursor = s.read_cursor;
 
@@ -658,7 +666,8 @@ async fn handle_last(
         }
     };
 
-    let s = session.lock().await;
+    let mut s = session.lock().await;
+    let _ = s.log_writer.flush_all();
     let messages_path = s.log_writer.messages_path().to_path_buf();
     drop(s);
 
@@ -816,7 +825,24 @@ async fn handle_screen(
         }
     };
 
-    let s = session.lock().await;
+    let mut s = session.lock().await;
+    // OpenCode has no TUI, so the dummy 1x1 VT parser would return garbage.
+    // Render the equivalent "what the agent is showing right now" from the
+    // structured JSON log instead — same formatter as the CLI's `log`
+    // markdown render.
+    if s.is_opencode {
+        let _ = s.log_writer.flush_all();
+        let messages_path = s.log_writer.messages_path().to_path_buf();
+        drop(s);
+
+        let messages = match reader::read_all(&messages_path) {
+            Ok(m) => m,
+            Err(e) => return err_json(&format!("Failed to read log: {e}")),
+        };
+        let lines = crate::log::formatter::format_messages(&messages);
+        return ok_json(serde_json::json!({"lines": lines}));
+    }
+
     let lines = s.screen_lines();
     ok_json(serde_json::json!({"lines": lines}))
 }
@@ -1239,7 +1265,8 @@ async fn handle_log_follow(
     };
 
     let (messages_path, mut cursor) = {
-        let s = session.lock().await;
+        let mut s = session.lock().await;
+        let _ = s.log_writer.flush_all();
         let path = s.log_writer.messages_path().to_path_buf();
         let cursor = since.unwrap_or(s.read_cursor);
         (path, cursor)
@@ -1258,6 +1285,14 @@ async fn handle_log_follow(
     let mut interval = tokio::time::interval(Duration::from_millis(200));
     loop {
         interval.tick().await;
+
+        // Force pending bytes to disk — opencode never ticks so its
+        // BufWriter only flushes here. Codex flushes from its own tick too,
+        // but a second flush here is harmless.
+        {
+            let mut s = session.lock().await;
+            let _ = s.log_writer.flush_all();
+        }
 
         let new_msgs = reader::read_since(&messages_path, cursor)?;
         for msg in &new_msgs {
