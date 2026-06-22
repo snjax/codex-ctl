@@ -204,6 +204,17 @@ async fn handle_spawn_opencode(
         None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
     };
 
+    // Bring up the persistent server before any state mutation. If it can't
+    // start we'd rather fail the spawn cleanly than leave a half-registered
+    // session behind.
+    let server_url = {
+        let d = daemon.read().await;
+        match d.ensure_opencode_server(binary_path).await {
+            Ok(u) => u,
+            Err(e) => return err_json(&format!("Failed to bring up opencode server: {e}")),
+        }
+    };
+
     let mut daemon_w = daemon.write().await;
     let session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let session_dir = daemon_w.sessions_dir.join(&session_id);
@@ -239,12 +250,14 @@ async fn handle_spawn_opencode(
     let cwd_clone = cwd.clone();
     let prompt_owned = prompt.to_string();
     let binary_owned = binary_path.to_string();
+    let server_owned = server_url.clone();
     let resume_owned = resume.map(|s| s.to_string());
 
     tokio::spawn(async move {
         opencode_run_loop(
             session_for_loop,
             &binary_owned,
+            &server_owned,
             &prompt_owned,
             &cwd_clone,
             resume_owned.as_deref(),
@@ -265,11 +278,12 @@ async fn handle_spawn_opencode(
 async fn opencode_run_loop(
     session: Arc<tokio::sync::Mutex<Session>>,
     binary: &str,
+    server_url: &str,
     prompt: &str,
     cwd: &std::path::Path,
     resume_sid: Option<&str>,
 ) {
-    let mut child = match crate::session::opencode::spawn_opencode_run(binary, prompt, cwd, resume_sid) {
+    let mut child = match crate::session::opencode::spawn_opencode_run(binary, server_url, prompt, cwd, resume_sid) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to spawn opencode: {e}");
@@ -744,7 +758,7 @@ async fn handle_act(
 /// Handle `act` for opencode sessions: extract prompt from actions,
 /// wait for idle if working, then spawn a continuation subprocess.
 async fn handle_act_opencode(
-    _daemon: Arc<RwLock<Daemon>>,
+    daemon: Arc<RwLock<Daemon>>,
     session: Arc<tokio::sync::Mutex<Session>>,
     actions: &[String],
 ) -> serde_json::Value {
@@ -814,6 +828,14 @@ async fn handle_act_opencode(
         None => return err_json("Opencode session has no recorded binary path (was it spawned before this fix?)"),
     };
 
+    let server_url = {
+        let d = daemon.read().await;
+        match d.ensure_opencode_server(&binary).await {
+            Ok(u) => u,
+            Err(e) => return err_json(&format!("Failed to bring up opencode server: {e}")),
+        }
+    };
+
     // Spawn continuation in background
     let session_for_loop = session.clone();
 
@@ -821,6 +843,7 @@ async fn handle_act_opencode(
         opencode_run_loop(
             session_for_loop,
             &binary,
+            &server_url,
             &prompt,
             &cwd,
             oc_sid.as_deref(),

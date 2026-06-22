@@ -10,33 +10,60 @@ use tokio::process::{Child, Command};
 
 use crate::log::LogMessage;
 
-/// Spawn `opencode run --format json` as a subprocess.
-///
-/// `binary` is the absolute path to opencode, resolved by the client.
-/// See `spawn_codex` for why the daemon must not resolve this itself.
+/// Spawn `opencode run --attach <server_url> --format json ...` as a
+/// subprocess. `binary` is the absolute path to opencode resolved by the
+/// client. `server_url` points at the persistent `opencode serve` owned by
+/// the daemon; using `--attach` is required to work around upstream issue
+/// sst/opencode#31109, where short-lived `opencode run` hangs after
+/// `exiting loop` on heavy resumed sessions.
 pub fn spawn_opencode_run(
     binary: &str,
+    server_url: &str,
     prompt: &str,
     cwd: &Path,
     session_id: Option<&str>,
 ) -> Result<Child> {
     let mut cmd = Command::new(binary);
     cmd.arg("run");
+    cmd.arg("--attach").arg(server_url);
     cmd.arg("--format").arg("json");
-    cmd.arg("--dir").arg(cwd);
 
+    // `--dir` over `--attach` is interpreted as the cwd on the server side.
+    // For new sessions we want the user's cwd, but for `--continue` the
+    // session already has a recorded directory and a mismatch (or even an
+    // equal one in some cases) silently produces an empty NDJSON stream.
+    // Omit `--dir` when continuing — opencode uses the session's recorded
+    // directory and the stream comes through.
     if let Some(sid) = session_id {
         cmd.arg("--continue").arg("--session").arg(sid);
+    } else {
+        cmd.arg("--dir").arg(cwd);
     }
 
     cmd.arg(prompt);
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());
-    cmd.stdin(Stdio::null());
+    // IMPORTANT: stdin handling tied to an upstream quirk of
+    // `opencode run --attach`. With `Stdio::null()` it stops emitting
+    // events after `step_start`. With a pipe that never closes it waits
+    // for interactive input. The reliable shape is: open a pipe, write a
+    // single newline, then close — same as shell `echo | opencode run`.
+    cmd.stdin(Stdio::piped());
 
-    let child = cmd.spawn()
+    let mut child = cmd.spawn()
         .context("Failed to spawn opencode")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        // Fire-and-forget: write happens in a task, the pipe closes when
+        // the task ends. Errors are ignored — at worst we get the
+        // null-stdin failure mode which we'd already have without this.
+        tokio::spawn(async move {
+            let _ = stdin.write_all(b"\n").await;
+            let _ = stdin.shutdown().await;
+        });
+    }
 
     Ok(child)
 }
