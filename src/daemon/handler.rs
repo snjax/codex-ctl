@@ -28,7 +28,7 @@ pub async fn handle_request(
         Request::List => handle_list(daemon).await,
         Request::Spawn { binary_path, prompt, cwd, gui, resume, opencode } => {
             if opencode {
-                handle_spawn_opencode(daemon, &binary_path, prompt.as_deref(), cwd.as_deref()).await
+                handle_spawn_opencode(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), resume.as_deref()).await
             } else {
                 handle_spawn(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), gui, resume.as_deref()).await
             }
@@ -192,6 +192,7 @@ async fn handle_spawn_opencode(
     binary_path: &str,
     prompt: Option<&str>,
     cwd: Option<&str>,
+    resume: Option<&str>,
 ) -> serde_json::Value {
     let prompt = match prompt {
         Some(p) => p,
@@ -219,6 +220,12 @@ async fn handle_spawn_opencode(
     {
         let mut s = session_arc.lock().await;
         s.id = session_id.clone();
+        // Remember the upstream opencode session id so this first run
+        // launches as `opencode run --continue --session <sid>` and every
+        // subsequent `act` continues the same upstream session.
+        if let Some(sid) = resume {
+            s.opencode_session_id = Some(sid.to_string());
+        }
         if let Err(e) = s.write_meta() {
             error!("Failed to write session meta: {e}");
         }
@@ -232,13 +239,24 @@ async fn handle_spawn_opencode(
     let cwd_clone = cwd.clone();
     let prompt_owned = prompt.to_string();
     let binary_owned = binary_path.to_string();
+    let resume_owned = resume.map(|s| s.to_string());
 
     tokio::spawn(async move {
-        opencode_run_loop(session_for_loop, &binary_owned, &prompt_owned, &cwd_clone, None).await;
+        opencode_run_loop(
+            session_for_loop,
+            &binary_owned,
+            &prompt_owned,
+            &cwd_clone,
+            resume_owned.as_deref(),
+        )
+        .await;
         // Don't schedule cleanup — opencode sessions stay idle for act
     });
 
-    info!("Spawned opencode session {session_id}");
+    info!(
+        "Spawned opencode session {session_id}{}",
+        resume.map(|s| format!(" (resuming {s})")).unwrap_or_default()
+    );
     ok_json(serde_json::json!({"ok": true, "session": session_id}))
 }
 
