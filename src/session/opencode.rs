@@ -22,11 +22,18 @@ pub fn spawn_opencode_run(
     prompt: &str,
     cwd: &Path,
     session_id: Option<&str>,
+    model: Option<&str>,
 ) -> Result<Child> {
     let mut cmd = Command::new(binary);
     cmd.arg("run");
     cmd.arg("--attach").arg(server_url);
     cmd.arg("--format").arg("json");
+
+    // Optional model override (`provider/model`). Absent => opencode's
+    // configured default model (unchanged behavior).
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
 
     // `--dir` over `--attach` is interpreted as the cwd on the server side.
     // For new sessions we want the user's cwd, but for `--continue` the

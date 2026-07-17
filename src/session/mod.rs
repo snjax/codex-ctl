@@ -109,6 +109,11 @@ pub struct Session {
     /// follow-up `act` requests can re-spawn `opencode run --continue`
     /// without needing the daemon to re-resolve `opencode` in its own PATH.
     pub opencode_binary: Option<String>,
+    /// Optional opencode model (`provider/model`), captured at spawn time so
+    /// the first run and every follow-up `act` continuation pass the same
+    /// `--model`. `None` = use opencode's configured default (unchanged
+    /// behavior). Ignored by the codex backend.
+    pub model: Option<String>,
 }
 
 impl Session {
@@ -154,6 +159,7 @@ impl Session {
             is_opencode: false,
             opencode_session_id: None,
             opencode_binary: None,
+            model: None,
         })
     }
 
@@ -200,6 +206,7 @@ impl Session {
             is_opencode: false,
             opencode_session_id: None,
             opencode_binary: None,
+            model: None,
         };
         Ok((session, spawn_result.master_fd))
     }
@@ -245,6 +252,7 @@ impl Session {
             is_opencode: true,
             opencode_session_id: None,
             opencode_binary: Some(binary.to_string()),
+            model: None,
         })
     }
 

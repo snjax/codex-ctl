@@ -57,6 +57,7 @@ Returns: {\"ok\":true, \"session\":\"<8-char-id>\"}",
   codex-ctl spawn \"refactor auth\" --cwd ~/project --gui\n\
   codex-ctl spawn --resume 019c8826-8134-7183-be06-6f93dd6dd5e5\n\
   codex-ctl spawn --resume 019c8826-... \"now fix tests too\"\n\
+  codex-ctl spawn --opencode --model zai/glm-5.2 \"read the repo\"\n\
   ID=$(codex-ctl spawn \"hello\" | jq -r .session)"
     )]
     Spawn {
@@ -79,6 +80,12 @@ Returns: {\"ok\":true, \"session\":\"<8-char-id>\"}",
         /// Use OpenCode backend instead of Codex
         #[arg(long)]
         opencode: bool,
+
+        /// OpenCode model as `provider/model` (e.g. `zai/glm-5.2`). Optional;
+        /// requires --opencode. When omitted, opencode uses its configured
+        /// default model (unchanged behavior).
+        #[arg(long, requires = "opencode")]
+        model: Option<String>,
     },
 
     /// List all active sessions
@@ -532,7 +539,7 @@ fn resolve_backend_binary(opencode: bool) -> Result<String, String> {
 
 fn build_request(command: Commands) -> protocol::Request {
     match command {
-        Commands::Spawn { prompt, cwd, gui, resume, opencode } => {
+        Commands::Spawn { prompt, cwd, gui, resume, opencode, model } => {
             if prompt.is_none() && resume.is_none() {
                 eprintln!("error: <PROMPT> is required unless --resume is specified");
                 std::process::exit(1);
@@ -544,7 +551,7 @@ fn build_request(command: Commands) -> protocol::Request {
                     std::process::exit(1);
                 }
             };
-            protocol::Request::Spawn { binary_path, prompt, cwd, gui, resume, opencode }
+            protocol::Request::Spawn { binary_path, prompt, cwd, gui, resume, opencode, model }
         }
         Commands::List => protocol::Request::List,
         Commands::State {

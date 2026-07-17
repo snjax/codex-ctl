@@ -18,6 +18,11 @@ pub enum Request {
         resume: Option<String>,
         #[serde(default)]
         opencode: bool,
+        /// Optional opencode model as `provider/model`. When set (opencode
+        /// backend only), passed through as `opencode run --model`. `None`
+        /// keeps opencode's configured default — fully backward compatible.
+        #[serde(default)]
+        model: Option<String>,
     },
     List,
     State {

@@ -26,9 +26,9 @@ pub async fn handle_request(
     match request {
         Request::Ping => ok_json(serde_json::json!({"ok": true})),
         Request::List => handle_list(daemon).await,
-        Request::Spawn { binary_path, prompt, cwd, gui, resume, opencode } => {
+        Request::Spawn { binary_path, prompt, cwd, gui, resume, opencode, model } => {
             if opencode {
-                handle_spawn_opencode(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), resume.as_deref()).await
+                handle_spawn_opencode(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), resume.as_deref(), model.as_deref()).await
             } else {
                 handle_spawn(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), gui, resume.as_deref()).await
             }
@@ -193,6 +193,7 @@ async fn handle_spawn_opencode(
     prompt: Option<&str>,
     cwd: Option<&str>,
     resume: Option<&str>,
+    model: Option<&str>,
 ) -> serde_json::Value {
     let prompt = match prompt {
         Some(p) => p,
@@ -237,6 +238,9 @@ async fn handle_spawn_opencode(
         if let Some(sid) = resume {
             s.opencode_session_id = Some(sid.to_string());
         }
+        // Persist the model so both this first run and every follow-up `act`
+        // continuation pass the same `--model`.
+        s.model = model.map(|m| m.to_string());
         if let Err(e) = s.write_meta() {
             error!("Failed to write session meta: {e}");
         }
@@ -252,6 +256,7 @@ async fn handle_spawn_opencode(
     let binary_owned = binary_path.to_string();
     let server_owned = server_url.clone();
     let resume_owned = resume.map(|s| s.to_string());
+    let model_owned = model.map(|s| s.to_string());
 
     tokio::spawn(async move {
         opencode_run_loop(
@@ -261,6 +266,7 @@ async fn handle_spawn_opencode(
             &prompt_owned,
             &cwd_clone,
             resume_owned.as_deref(),
+            model_owned.as_deref(),
         )
         .await;
         // Don't schedule cleanup — opencode sessions stay idle for act
@@ -282,8 +288,9 @@ async fn opencode_run_loop(
     prompt: &str,
     cwd: &std::path::Path,
     resume_sid: Option<&str>,
+    model: Option<&str>,
 ) {
-    let mut child = match crate::session::opencode::spawn_opencode_run(binary, server_url, prompt, cwd, resume_sid) {
+    let mut child = match crate::session::opencode::spawn_opencode_run(binary, server_url, prompt, cwd, resume_sid, model) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to spawn opencode: {e}");
@@ -813,13 +820,14 @@ async fn handle_act_opencode(
         let _ = s.log_writer.append_message(&msg);
     }
 
-    // Get opencode session ID, cwd, and binary path for continuation
-    let (oc_sid, cwd, binary) = {
+    // Get opencode session ID, cwd, binary path, and model for continuation
+    let (oc_sid, cwd, binary, model) = {
         let s = session.lock().await;
         (
             s.opencode_session_id.clone(),
             s.cwd.clone(),
             s.opencode_binary.clone(),
+            s.model.clone(),
         )
     };
 
@@ -847,6 +855,7 @@ async fn handle_act_opencode(
             &prompt,
             &cwd,
             oc_sid.as_deref(),
+            model.as_deref(),
         )
         .await;
     });
