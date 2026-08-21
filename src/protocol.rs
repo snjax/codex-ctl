@@ -1,12 +1,27 @@
 use serde::{Deserialize, Serialize};
 
+/// Which upstream agent this session drives.
+///
+/// Codex and Kimi are PTY-based TUIs — one long-lived subprocess per
+/// session that we drive with keystrokes via `act`. Opencode is a
+/// subprocess-per-turn NDJSON backend fronted by a persistent
+/// `opencode serve` (see `daemon/opencode_server.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    #[default]
+    Codex,
+    Opencode,
+    Kimi,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Spawn {
-        /// Absolute path to the backend binary (codex or opencode), resolved
-        /// by the client using the client's PATH. The daemon execs this path
-        /// directly so its own PATH is irrelevant.
+        /// Absolute path to the backend binary (codex, opencode, or kimi),
+        /// resolved by the client using the client's PATH. The daemon execs
+        /// this path directly so its own PATH is irrelevant.
         binary_path: String,
         #[serde(default)]
         prompt: Option<String>,
@@ -16,8 +31,12 @@ pub enum Request {
         gui: bool,
         #[serde(default)]
         resume: Option<String>,
+        /// Which backend to spawn. Defaults to `Codex` for backwards
+        /// compatibility with pre-Backend-enum clients (which shipped an
+        /// `opencode: bool` field that is silently ignored now — such
+        /// callers get Codex, matching the old `opencode: false` default).
         #[serde(default)]
-        opencode: bool,
+        backend: Backend,
         /// Optional opencode model as `provider/model`. When set (opencode
         /// backend only), passed through as `opencode run --model`. `None`
         /// keeps opencode's configured default — fully backward compatible.
@@ -147,6 +166,38 @@ mod tests {
         // pre-fix clients fail loudly instead of silently breaking.
         let json = r#"{"cmd":"spawn","prompt":"hello","cwd":"/tmp"}"#;
         assert!(serde_json::from_str::<Request>(json).is_err());
+    }
+
+    #[test]
+    fn test_request_spawn_backend_default_is_codex() {
+        // Old clients that omitted `backend` (or shipped the retired
+        // `opencode: bool`) must map to Backend::Codex.
+        let json = r#"{"cmd":"spawn","binary_path":"/usr/bin/codex","prompt":"x"}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Spawn { backend, .. } => assert_eq!(backend, Backend::Codex),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_request_spawn_backend_kimi_roundtrip() {
+        let json = r#"{"cmd":"spawn","binary_path":"/usr/bin/kimi","prompt":"x","backend":"kimi"}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Spawn { backend, .. } => assert_eq!(backend, Backend::Kimi),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_request_spawn_backend_opencode_roundtrip() {
+        let json = r#"{"cmd":"spawn","binary_path":"/usr/bin/opencode","prompt":"x","backend":"opencode"}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        match req {
+            Request::Spawn { backend, .. } => assert_eq!(backend, Backend::Opencode),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

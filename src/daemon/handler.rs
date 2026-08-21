@@ -26,11 +26,18 @@ pub async fn handle_request(
     match request {
         Request::Ping => ok_json(serde_json::json!({"ok": true})),
         Request::List => handle_list(daemon).await,
-        Request::Spawn { binary_path, prompt, cwd, gui, resume, opencode, model } => {
-            if opencode {
-                handle_spawn_opencode(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), resume.as_deref(), model.as_deref()).await
-            } else {
-                handle_spawn(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), gui, resume.as_deref()).await
+        Request::Spawn { binary_path, prompt, cwd, gui, resume, backend, model } => {
+            use crate::protocol::Backend;
+            match backend {
+                Backend::Opencode => {
+                    handle_spawn_opencode(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), resume.as_deref(), model.as_deref()).await
+                }
+                Backend::Kimi => {
+                    handle_spawn_kimi(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), gui, resume.as_deref()).await
+                }
+                Backend::Codex => {
+                    handle_spawn(daemon, &binary_path, prompt.as_deref(), cwd.as_deref(), gui, resume.as_deref()).await
+                }
             }
         }
         Request::State {
@@ -184,6 +191,151 @@ async fn handle_spawn(
     }
 
     info!("Spawned session {session_id}, pid {pid}");
+    ok_json(serde_json::json!({"ok": true, "session": session_id}))
+}
+
+/// Kimi is PTY-based and drives with the same read-loop / cleanup / GUI plumbing
+/// as codex — only the child command differs. This mirrors `handle_spawn`
+/// verbatim except for the `spawn_kimi` + `Session::new_kimi` calls; keeping
+/// them as separate functions makes the diff obvious and lets kimi grow
+/// independent quirks later without threading a `Backend` param through the
+/// codex path.
+async fn handle_spawn_kimi(
+    daemon: Arc<RwLock<Daemon>>,
+    kimi_path: &str,
+    prompt: Option<&str>,
+    cwd: Option<&str>,
+    gui: bool,
+    resume: Option<&str>,
+) -> serde_json::Value {
+    let cwd = match cwd {
+        Some(c) => PathBuf::from(c),
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+    };
+
+    let spawn_result = match crate::session::pty::spawn_kimi(kimi_path, prompt, &cwd, resume) {
+        Ok(r) => r,
+        Err(e) => return err_json(&format!("Failed to spawn kimi: {e}")),
+    };
+
+    let display_prompt = prompt.unwrap_or("");
+    let mut daemon_w = daemon.write().await;
+    let session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let session_dir = daemon_w.sessions_dir.join(&session_id);
+    if let Err(e) = std::fs::create_dir_all(&session_dir) {
+        return err_json(&format!("Failed to create session dir: {e}"));
+    }
+
+    let pid = spawn_result.pid;
+
+    let (mut session, owned_fd) = match Session::new_kimi(
+        spawn_result,
+        display_prompt,
+        &cwd,
+        &session_dir,
+    ) {
+        Ok(s) => s,
+        Err(e) => return err_json(&format!("Failed to create session: {e}")),
+    };
+
+    session.id = session_id.clone();
+    // Preseed the kimi session id when resuming so `list`/`kill` return it
+    // immediately without waiting for a screen scan.
+    if let Some(rid) = resume {
+        session.kimi_session_id = Some(rid.to_string());
+    }
+    // Hold state at Working through the pre-inject settle window so
+    // external `state --wait` doesn't return before the first prompt has
+    // actually been submitted to kimi's TUI.
+    if prompt.is_some() {
+        session.awaiting_initial_prompt = true;
+    }
+
+    if let Err(e) = session.write_meta() {
+        error!("Failed to write session meta: {e}");
+    }
+
+    let session_arc = Arc::new(tokio::sync::Mutex::new(session));
+    daemon_w.sessions.insert(session_id.clone(), session_arc.clone());
+
+    let session_for_loop = session_arc.clone();
+    let pty_broadcast = {
+        let s = session_for_loop.lock().await;
+        s.pty_broadcast.clone()
+    };
+    let daemon_for_loop = daemon.clone();
+    let session_id_for_loop = session_id.clone();
+
+    tokio::spawn(async move {
+        pty_read_loop(session_for_loop, owned_fd, pty_broadcast).await;
+        schedule_dead_session_cleanup(daemon_for_loop, session_id_for_loop);
+    });
+
+    // Kimi refuses positional prompts on the CLI (they parse as
+    // subcommand names). Type the initial prompt into the PTY once kimi's
+    // TUI settles. We watch `last_esc_seen` for a quiet window rather
+    // than `wait_for_state(Idle)` because we intentionally suppress the
+    // pre-inject Idle so external `state --wait` doesn't fire early.
+    if let Some(prompt_text) = prompt {
+        let session_for_prompt = session_arc.clone();
+        let prompt_owned = prompt_text.to_string();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            let master_fd = loop {
+                if tokio::time::Instant::now() > deadline {
+                    error!("Timed out waiting for kimi TUI to settle for prompt injection");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let s = session_for_prompt.lock().await;
+                if s.state == SessionState::Dead {
+                    return;
+                }
+                let quiet_for = std::time::Instant::now().duration_since(s.last_esc_seen);
+                // ≥1.5s of PTY silence + trust prompt already dismissed
+                // (or absent) means kimi's TUI is done painting and the
+                // input line is receptive.
+                // 3s of PTY silence gives kimi's TUI time to fully settle
+                // after startup splash + trust-prompt dismissal. 1.5s
+                // sometimes injects before kimi's input handler is ready
+                // and Enter is dropped.
+                if s.has_seen_esc && quiet_for >= Duration::from_millis(3000) {
+                    info!("kimi: settling done ({:?} silent), injecting prompt ({} bytes)", quiet_for, prompt_owned.len());
+                    break s.master_fd;
+                }
+            };
+            if let Err(e) = write_to_pty(master_fd, prompt_owned.as_bytes()) {
+                error!("Failed to type initial prompt into kimi PTY: {e}");
+                return;
+            }
+            // Small delay so kimi's TUI processes the paste of prompt
+            // chars before we send Enter — without this, Enter can race
+            // ahead of the last few chars and get dropped.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = write_to_pty(master_fd, b"\r");
+            // Give kimi enough time to actually start processing the
+            // submitted message so the next Idle transition reflects
+            // real work-done, not the pre-inject settle.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut s = session_for_prompt.lock().await;
+            s.awaiting_initial_prompt = false;
+        });
+    }
+
+    if gui {
+        let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("codex-ctl"));
+        match crate::gui::spawn_gui_window(&session_id, &binary) {
+            Ok(gui_pid) => {
+                let mut s = session_arc.lock().await;
+                s.gui_pid = Some(gui_pid);
+            }
+            Err(e) => {
+                error!("Failed to spawn GUI: {e}");
+            }
+        }
+    }
+
+    info!("Spawned kimi session {session_id}, pid {pid}");
     ok_json(serde_json::json!({"ok": true, "session": session_id}))
 }
 
@@ -385,13 +537,22 @@ async fn pty_read_loop(
                                 let _ = pty_broadcast.send(Bytes::copy_from_slice(data));
                                 // Feed session
                                 let mut s = session.lock().await;
-                                let needs_enter = s.on_pty_data(data);
-                                if needs_enter {
-                                    // Auto-dismiss trust directory prompt
+                                let needs_dismiss = s.on_pty_data(data);
+                                if needs_dismiss {
+                                    // Codex highlights "Yes, continue" by
+                                    // default, so a single Enter accepts.
+                                    // Kimi highlights "Don't trust" (which
+                                    // exits kimi), so we need Up-arrow
+                                    // first to move to "Trust this folder".
                                     let master_fd = s.master_fd;
+                                    let bytes: &[u8] = if s.is_kimi() {
+                                        b"\x1b[A\r"
+                                    } else {
+                                        b"\r"
+                                    };
                                     drop(s);
                                     info!("Auto-dismissing trust directory prompt");
-                                    let _ = write_to_pty(master_fd, b"\r");
+                                    let _ = write_to_pty(master_fd, bytes);
                                 }
                             }
                             Ok(Err(e)) => {
@@ -736,7 +897,7 @@ async fn handle_act(
 
     let (is_opencode, state) = {
         let s = session.lock().await;
-        (s.is_opencode, s.state.clone())
+        (s.is_opencode(), s.state.clone())
     };
 
     if state == SessionState::Dead {
@@ -880,7 +1041,7 @@ async fn handle_screen(
     // Render the equivalent "what the agent is showing right now" from the
     // structured JSON log instead — same formatter as the CLI's `log`
     // markdown render.
-    if s.is_opencode {
+    if s.is_opencode() {
         let _ = s.log_writer.flush_all();
         let messages_path = s.log_writer.messages_path().to_path_buf();
         drop(s);
@@ -1012,6 +1173,77 @@ fn scan_for_codex_session_id(lines: &[String]) -> Option<String> {
     None
 }
 
+/// Refresh both codex and kimi session-id caches on the given session in one
+/// shot. Kept as a helper because every kill-loop return site needs the
+/// same pair of scans and inlining them all triples the boilerplate.
+fn capture_pty_session_ids(s: &mut Session) {
+    if s.codex_session_id.is_none() {
+        let lines = s.screen_lines();
+        if let Some(uuid) = scan_for_codex_session_id(&lines) {
+            info!("Captured codex session ID: {uuid}");
+            s.codex_session_id = Some(uuid);
+        }
+    }
+    if s.is_kimi() && s.kimi_session_id.is_none() {
+        if let Some(uuid) = scan_for_kimi_session_id(s.created_at) {
+            info!("Captured kimi session ID: {uuid}");
+            s.kimi_session_id = Some(uuid);
+        }
+    }
+}
+
+/// Find the kimi session UUID created since `created_at` by walking
+/// `~/.kimi-code/sessions/wd_*/session_<UUID>/` and picking the newest
+/// directory whose mtime falls at or after the session's start.
+///
+/// Kimi doesn't announce its session id in the TUI (unlike codex, which
+/// prints `codex resume <uuid>` on `ctrl+c`), so we recover it from disk
+/// state. The bound on `created_at` prevents us from claiming an
+/// unrelated older session dir when the user happens to spawn kimi with
+/// no new session having been persisted yet.
+fn scan_for_kimi_session_id(created_at: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    use std::time::{Duration, SystemTime};
+    let home = std::env::var("HOME").ok()?;
+    let sessions_root = std::path::Path::new(&home).join(".kimi-code/sessions");
+    let cutoff = SystemTime::UNIX_EPOCH + Duration::from_secs(created_at.timestamp().max(0) as u64);
+
+    let mut best: Option<(SystemTime, String)> = None;
+    let wd_iter = std::fs::read_dir(&sessions_root).ok()?;
+    for wd_entry in wd_iter.flatten() {
+        let wd_name = wd_entry.file_name();
+        let wd_name = wd_name.to_string_lossy();
+        if !wd_name.starts_with("wd_") {
+            continue;
+        }
+        let sess_iter = match std::fs::read_dir(wd_entry.path()) {
+            Ok(it) => it,
+            Err(_) => continue,
+        };
+        for sess_entry in sess_iter.flatten() {
+            let name = sess_entry.file_name();
+            let name = name.to_string_lossy().into_owned();
+            // Kimi's own resume expects the full `session_<UUID>` form as
+            // passed to `-S`, not the bare UUID — matches the on-disk
+            // directory name.
+            if !name.starts_with("session_") {
+                continue;
+            }
+            let meta = match sess_entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if modified < cutoff {
+                continue;
+            }
+            if best.as_ref().map(|(t, _)| modified > *t).unwrap_or(true) {
+                best = Some((modified, name));
+            }
+        }
+    }
+    best.map(|(_, u)| u)
+}
+
 /// Check if process has exited (non-blocking). Returns Some(exit_code) or None if still alive.
 fn try_reap(pid: nix::unistd::Pid) -> Option<Option<i32>> {
     match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
@@ -1036,7 +1268,7 @@ async fn handle_kill(
 
     let is_opencode = {
         let s = session.lock().await;
-        s.is_opencode
+        s.is_opencode()
     };
 
     let result = if is_opencode {
@@ -1062,6 +1294,7 @@ async fn kill_session(
             return ok_json(serde_json::json!({
                 "ok": true,
                 "codex_session_id": s.codex_session_id,
+                "kimi_session_id": s.kimi_session_id,
             }));
         }
     }
@@ -1082,14 +1315,7 @@ async fn kill_session(
                 tokio::time::sleep(Duration::from_millis(100)).await;
 
                 let mut s = session.lock().await;
-                // Scan for UUID
-                if s.codex_session_id.is_none() {
-                    let lines = s.screen_lines();
-                    if let Some(uuid) = scan_for_codex_session_id(&lines) {
-                        info!("Captured codex session ID: {uuid}");
-                        s.codex_session_id = Some(uuid);
-                    }
-                }
+                capture_pty_session_ids(&mut s);
 
                 // Check if process exited
                 if let Some(code) = try_reap(s.pid) {
@@ -1097,6 +1323,7 @@ async fn kill_session(
                     return ok_json(serde_json::json!({
                         "ok": true,
                         "codex_session_id": s.codex_session_id,
+                        "kimi_session_id": s.kimi_session_id,
                     }));
                 }
             }
@@ -1108,14 +1335,7 @@ async fn kill_session(
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut s = session.lock().await;
-        // Scan for UUID
-        if s.codex_session_id.is_none() {
-            let lines = s.screen_lines();
-            if let Some(uuid) = scan_for_codex_session_id(&lines) {
-                info!("Captured codex session ID: {uuid}");
-                s.codex_session_id = Some(uuid);
-            }
-        }
+        capture_pty_session_ids(&mut s);
 
         // Check if process exited
         if let Some(code) = try_reap(s.pid) {
@@ -1123,6 +1343,7 @@ async fn kill_session(
             return ok_json(serde_json::json!({
                 "ok": true,
                 "codex_session_id": s.codex_session_id,
+                "kimi_session_id": s.kimi_session_id,
             }));
         }
     }
@@ -1139,15 +1360,11 @@ async fn kill_session(
         let mut s = session.lock().await;
         if let Some(code) = try_reap(s.pid) {
             s.mark_dead(code);
-            if s.codex_session_id.is_none() {
-                let lines = s.screen_lines();
-                if let Some(uuid) = scan_for_codex_session_id(&lines) {
-                    s.codex_session_id = Some(uuid);
-                }
-            }
+            capture_pty_session_ids(&mut s);
             return ok_json(serde_json::json!({
                 "ok": true,
                 "codex_session_id": s.codex_session_id,
+                "kimi_session_id": s.kimi_session_id,
             }));
         }
     }
@@ -1164,9 +1381,13 @@ async fn kill_session(
     let exit_code = try_reap(s.pid).unwrap_or(None);
     s.mark_dead(exit_code);
 
+    if s.is_kimi() && s.kimi_session_id.is_none() {
+        s.kimi_session_id = scan_for_kimi_session_id(s.created_at);
+    }
     ok_json(serde_json::json!({
         "ok": true,
         "codex_session_id": s.codex_session_id,
+        "kimi_session_id": s.kimi_session_id,
     }))
 }
 
@@ -1222,7 +1443,7 @@ async fn handle_killall(
 
         let is_oc = {
             let s = session.lock().await;
-            s.is_opencode
+            s.is_opencode()
         };
         let result = if is_oc {
             kill_opencode_session(&session).await

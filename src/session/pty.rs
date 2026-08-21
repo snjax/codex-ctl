@@ -102,6 +102,67 @@ pub fn spawn_codex(
     }
 }
 
+/// Spawn kimi under a PTY. `kimi_path` is the absolute path to the kimi
+/// binary, resolved by the client. Same rationale as `spawn_codex`.
+///
+/// When `resume_id` is `Some(id)`, spawns `kimi --auto -S <id>`.
+/// When `resume_id` is `None`, spawns `kimi --auto`.
+///
+/// Unlike codex, the initial prompt is NOT passed as a CLI arg — `kimi`
+/// treats positional args as subcommand names and would exit 1. The
+/// prompt is instead typed into the PTY after startup by
+/// `handle_spawn_kimi` (see daemon/handler.rs).
+///
+/// Kimi has no `-C <cwd>` equivalent so we chdir the child before exec.
+pub fn spawn_kimi(
+    kimi_path: &str,
+    _prompt: Option<&str>,
+    cwd: &Path,
+    resume_id: Option<&str>,
+) -> Result<SpawnResult> {
+    let winsize = Winsize {
+        ws_row: PTY_ROWS,
+        ws_col: PTY_COLS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+
+    let fork_result = unsafe { forkpty(&winsize, None) }
+        .context("forkpty failed")?;
+
+    match fork_result {
+        ForkptyResult::Parent { child, master } => {
+            let fd = master.as_fd();
+            use std::os::fd::AsRawFd;
+            let raw_fd = fd.as_raw_fd();
+            let flags = nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_GETFL)?;
+            let mut oflags = nix::fcntl::OFlag::from_bits_truncate(flags);
+            oflags.insert(nix::fcntl::OFlag::O_NONBLOCK);
+            nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_SETFL(oflags))?;
+
+            Ok(SpawnResult { pid: child, master_fd: master })
+        }
+        ForkptyResult::Child => {
+            if let Err(e) = std::env::set_current_dir(cwd) {
+                eprintln!("codex-ctl: failed to chdir: {e}");
+                std::process::exit(1);
+            }
+
+            let kimi_c = CString::new(kimi_path).unwrap();
+            let mut args: Vec<CString> = vec![kimi_c.clone()];
+            args.push(CString::new("--auto").unwrap());
+            if let Some(id) = resume_id {
+                args.push(CString::new("-S").unwrap());
+                args.push(CString::new(id).unwrap());
+            }
+
+            let _ = execvp(&kimi_c, &args);
+            eprintln!("codex-ctl: failed to exec kimi");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Spawn an arbitrary command under PTY (for testing).
 #[allow(dead_code)]
 pub fn spawn_command(program: &str, args: &[&str], cwd: &Path) -> Result<SpawnResult> {

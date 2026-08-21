@@ -102,8 +102,21 @@ pub struct Session {
     // Auto-dismiss trust prompt (fires once)
     pub trust_prompt_dismissed: bool,
 
-    // OpenCode backend
-    pub is_opencode: bool,
+    // Which upstream agent drives this session. Codex/Kimi are PTY-based
+    // (long-lived TUI subprocess); Opencode is subprocess-per-turn.
+    pub backend: crate::protocol::Backend,
+
+    /// True between kimi TUI-ready and our post-startup prompt injection.
+    /// Kimi takes the initial prompt via keystrokes into its TUI (not on
+    /// the CLI), so the session briefly reaches Idle after startup with
+    /// no user work done. Suppressing that Idle keeps `state --wait` from
+    /// returning before the injected prompt has actually been submitted.
+    pub awaiting_initial_prompt: bool,
+
+    // Kimi's own session UUID (captured from terminal output).
+    pub kimi_session_id: Option<String>,
+
+    // OpenCode-specific state, unused for other backends.
     pub opencode_session_id: Option<String>,
     /// Absolute path to the opencode binary, captured at spawn time so
     /// follow-up `act` requests can re-spawn `opencode run --continue`
@@ -114,6 +127,20 @@ pub struct Session {
     /// `--model`. `None` = use opencode's configured default (unchanged
     /// behavior). Ignored by the codex backend.
     pub model: Option<String>,
+}
+
+impl Session {
+    /// True when the session drives opencode. Provided as a method so the
+    /// many existing dispatch sites (`if s.is_opencode { … }`) keep reading
+    /// naturally after the switch from a raw `bool` field to `Backend`.
+    pub fn is_opencode(&self) -> bool {
+        self.backend == crate::protocol::Backend::Opencode
+    }
+
+    /// True when the session drives kimi (PTY-based, like codex).
+    pub fn is_kimi(&self) -> bool {
+        self.backend == crate::protocol::Backend::Kimi
+    }
 }
 
 impl Session {
@@ -156,7 +183,9 @@ impl Session {
             has_seen_esc: false,
             codex_session_id: None,
             trust_prompt_dismissed: false,
-            is_opencode: false,
+            backend: crate::protocol::Backend::Codex,
+            awaiting_initial_prompt: false,
+            kimi_session_id: None,
             opencode_session_id: None,
             opencode_binary: None,
             model: None,
@@ -203,7 +232,9 @@ impl Session {
             has_seen_esc: false,
             codex_session_id: None,
             trust_prompt_dismissed: false,
-            is_opencode: false,
+            backend: crate::protocol::Backend::Codex,
+            awaiting_initial_prompt: false,
+            kimi_session_id: None,
             opencode_session_id: None,
             opencode_binary: None,
             model: None,
@@ -249,11 +280,28 @@ impl Session {
             has_seen_esc: false,
             codex_session_id: None,
             trust_prompt_dismissed: false,
-            is_opencode: true,
+            backend: crate::protocol::Backend::Opencode,
+            awaiting_initial_prompt: false,
+            kimi_session_id: None,
             opencode_session_id: None,
             opencode_binary: Some(binary.to_string()),
             model: None,
         })
+    }
+
+    /// Create a Kimi session — PTY-based like codex. `spawn_result` comes
+    /// from `pty::spawn_kimi`. Distinct from `new_with_owned_fd` only in
+    /// the `backend` marker so downstream dispatch (kill/act/screen) picks
+    /// the kimi variant.
+    pub fn new_kimi(
+        spawn_result: pty::SpawnResult,
+        prompt: &str,
+        cwd: &Path,
+        session_dir: &Path,
+    ) -> Result<(Self, OwnedFd)> {
+        let (mut session, fd) = Self::new_with_owned_fd(spawn_result, prompt, cwd, session_dir)?;
+        session.backend = crate::protocol::Backend::Kimi;
+        Ok((session, fd))
     }
 
     /// Write session metadata to disk.
@@ -286,9 +334,23 @@ impl Session {
             self.last_esc_seen = now;
             self.has_seen_esc = true;
         }
+        // Kimi's TUI has no persistent "esc to interrupt"-equivalent
+        // status line, so we can't watermark "we're working" from screen
+        // content. Instead treat *any* PTY byte as activity: as long as
+        // kimi keeps writing, we're working; ≥1s of silence flips to
+        // idle via the same `elapsed >= 1s` rule used by codex.
+        if self.backend == crate::protocol::Backend::Kimi && !data.is_empty() {
+            self.last_esc_seen = now;
+            self.has_seen_esc = true;
+        }
         let mut detected = detect_state(&filtered, self.last_esc_seen, now);
         // Don't allow idle until we've seen "esc to interrupt" at least once
         if detected.state == SessionState::Idle && !self.has_seen_esc {
+            detected.state = SessionState::Working;
+        }
+        // Suppress the pre-inject "TUI ready" idle for kimi so
+        // `state --wait` doesn't return before we've submitted anything.
+        if detected.state == SessionState::Idle && self.awaiting_initial_prompt {
             detected.state = SessionState::Working;
         }
         self.update_state(detected);
@@ -300,17 +362,24 @@ impl Session {
         needs_enter
     }
 
-    /// Detect the codex "trust this directory?" prompt.
+    /// Detect the codex or kimi "trust this directory?" prompt.
     /// Returns true once per occurrence (won't fire repeatedly).
     fn detect_trust_prompt(&mut self, lines: &[String]) -> bool {
         if self.trust_prompt_dismissed {
             return false;
         }
-        let has_trust = lines.iter().any(|l| l.contains("Do you trust the contents of this directory"));
-        let has_continue = lines.iter().any(|l| {
-            l.contains("Yes, continue") || l.contains("Press enter to continue")
-        });
-        if has_trust && has_continue {
+        // Codex: "Do you trust the contents of this directory" + a "Yes,
+        // continue" / "Press enter to continue" option.
+        let codex_trust = lines.iter().any(|l| l.contains("Do you trust the contents of this directory"))
+            && lines.iter().any(|l| {
+                l.contains("Yes, continue") || l.contains("Press enter to continue")
+            });
+        // Kimi: "Trust this folder?" heading + "Enter select" footer. The
+        // "Trust this folder" option is the pre-selected default, so a
+        // single Enter accepts.
+        let kimi_trust = lines.iter().any(|l| l.contains("Trust this folder?"))
+            && lines.iter().any(|l| l.contains("Enter select"));
+        if codex_trust || kimi_trust {
             self.trust_prompt_dismissed = true;
             true
         } else {
@@ -337,6 +406,10 @@ impl Session {
         let mut detected = detect_state(&filtered, self.last_esc_seen, now);
         // Don't allow idle until we've seen "esc to interrupt" at least once
         if detected.state == SessionState::Idle && !self.has_seen_esc {
+            detected.state = SessionState::Working;
+        }
+        // Same pre-inject guard as in on_pty_data.
+        if detected.state == SessionState::Idle && self.awaiting_initial_prompt {
             detected.state = SessionState::Working;
         }
         self.update_state(detected);
@@ -445,13 +518,26 @@ impl Session {
             "created_at": self.created_at.to_rfc3339(),
             "prompt": self.prompt,
         });
-        if self.is_opencode {
-            info["backend"] = serde_json::json!("opencode");
-            if let Some(ref sid) = self.opencode_session_id {
-                info["opencode_session_id"] = serde_json::json!(sid);
+        use crate::protocol::Backend;
+        match self.backend {
+            Backend::Opencode => {
+                info["backend"] = serde_json::json!("opencode");
+                if let Some(ref sid) = self.opencode_session_id {
+                    info["opencode_session_id"] = serde_json::json!(sid);
+                }
             }
-        } else {
-            info["backend"] = serde_json::json!("codex");
+            Backend::Kimi => {
+                info["backend"] = serde_json::json!("kimi");
+                if let Some(ref sid) = self.kimi_session_id {
+                    info["kimi_session_id"] = serde_json::json!(sid);
+                }
+            }
+            Backend::Codex => {
+                info["backend"] = serde_json::json!("codex");
+                if let Some(ref sid) = self.codex_session_id {
+                    info["codex_session_id"] = serde_json::json!(sid);
+                }
+            }
         }
         info
     }

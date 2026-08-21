@@ -78,8 +78,12 @@ Returns: {\"ok\":true, \"session\":\"<8-char-id>\"}",
         resume: Option<String>,
 
         /// Use OpenCode backend instead of Codex
-        #[arg(long)]
+        #[arg(long, conflicts_with = "kimi")]
         opencode: bool,
+
+        /// Use Kimi Code backend (`kimi --auto`, PTY-based like Codex).
+        #[arg(long, conflicts_with = "opencode")]
+        kimi: bool,
 
         /// OpenCode model as `provider/model` (e.g. `zai/glm-5.2`). Optional;
         /// requires --opencode. When omitted, opencode uses its configured
@@ -521,13 +525,15 @@ async fn ensure_daemon() -> anyhow::Result<()> {
 
 /// Resolve the backend binary using the client's PATH so the daemon doesn't
 /// have to. The daemon's PATH is whatever leaked in at daemon-startup time
-/// and can easily lack nvm/cargo/bun dirs where the user installed codex or
-/// opencode — resolving here means failure is per-call and recoverable.
-fn resolve_backend_binary(opencode: bool) -> Result<String, String> {
-    let (env_var, name) = if opencode {
-        ("CODEX_CTL_OPENCODE_PATH", "opencode")
-    } else {
-        ("CODEX_CTL_CODEX_PATH", "codex")
+/// and can easily lack nvm/cargo/bun dirs where the user installed the
+/// upstream agents — resolving here means failure is per-call and
+/// recoverable.
+fn resolve_backend_binary(backend: protocol::Backend) -> Result<String, String> {
+    use protocol::Backend;
+    let (env_var, name) = match backend {
+        Backend::Opencode => ("CODEX_CTL_OPENCODE_PATH", "opencode"),
+        Backend::Kimi => ("CODEX_CTL_KIMI_PATH", "kimi"),
+        Backend::Codex => ("CODEX_CTL_CODEX_PATH", "codex"),
     };
     if let Ok(p) = std::env::var(env_var) {
         return Ok(p);
@@ -539,19 +545,27 @@ fn resolve_backend_binary(opencode: bool) -> Result<String, String> {
 
 fn build_request(command: Commands) -> protocol::Request {
     match command {
-        Commands::Spawn { prompt, cwd, gui, resume, opencode, model } => {
+        Commands::Spawn { prompt, cwd, gui, resume, opencode, kimi, model } => {
             if prompt.is_none() && resume.is_none() {
                 eprintln!("error: <PROMPT> is required unless --resume is specified");
                 std::process::exit(1);
             }
-            let binary_path = match resolve_backend_binary(opencode) {
+            // clap's `conflicts_with` guarantees at most one of --opencode/--kimi.
+            let backend = if opencode {
+                protocol::Backend::Opencode
+            } else if kimi {
+                protocol::Backend::Kimi
+            } else {
+                protocol::Backend::Codex
+            };
+            let binary_path = match resolve_backend_binary(backend) {
                 Ok(p) => p,
                 Err(msg) => {
                     eprintln!("error: {msg}");
                     std::process::exit(1);
                 }
             };
-            protocol::Request::Spawn { binary_path, prompt, cwd, gui, resume, opencode, model }
+            protocol::Request::Spawn { binary_path, prompt, cwd, gui, resume, backend, model }
         }
         Commands::List => protocol::Request::List,
         Commands::State {
