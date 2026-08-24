@@ -10,15 +10,19 @@ use tokio::process::{Child, Command};
 
 use crate::log::LogMessage;
 
-/// Spawn `opencode run --attach <server_url> --format json ...` as a
-/// subprocess. `binary` is the absolute path to opencode resolved by the
-/// client. `server_url` points at the persistent `opencode serve` owned by
-/// the daemon; using `--attach` is required to work around upstream issue
-/// sst/opencode#31109, where short-lived `opencode run` hangs after
-/// `exiting loop` on heavy resumed sessions.
+/// Spawn `opencode run --format json ...` as a short-lived subprocess.
+///
+/// Earlier revisions routed this through a persistent `opencode serve`
+/// via `--attach` to dodge upstream hang #31109 on heavy resumed
+/// sessions. As of opencode 1.18.x that hang is fixed AND `--attach`
+/// itself drops model-response events on stdout — the workaround now
+/// causes the failure it was meant to prevent. Direct `opencode run` in
+/// 1.18 is verified to complete cleanly on both fresh and heavy
+/// resumed sessions.
+///
+/// `binary` is the absolute path resolved by the client.
 pub fn spawn_opencode_run(
     binary: &str,
-    server_url: &str,
     prompt: &str,
     cwd: &Path,
     session_id: Option<&str>,
@@ -26,8 +30,8 @@ pub fn spawn_opencode_run(
 ) -> Result<Child> {
     let mut cmd = Command::new(binary);
     cmd.arg("run");
-    cmd.arg("--attach").arg(server_url);
     cmd.arg("--format").arg("json");
+    cmd.arg("--dir").arg(cwd);
 
     // Optional model override (`provider/model`). Absent => opencode's
     // configured default model (unchanged behavior).
@@ -35,27 +39,18 @@ pub fn spawn_opencode_run(
         cmd.arg("--model").arg(m);
     }
 
-    // `--dir` over `--attach` is interpreted as the cwd on the server side.
-    // For new sessions we want the user's cwd, but for `--continue` the
-    // session already has a recorded directory and a mismatch (or even an
-    // equal one in some cases) silently produces an empty NDJSON stream.
-    // Omit `--dir` when continuing — opencode uses the session's recorded
-    // directory and the stream comes through.
     if let Some(sid) = session_id {
         cmd.arg("--continue").arg("--session").arg(sid);
-    } else {
-        cmd.arg("--dir").arg(cwd);
     }
 
     cmd.arg(prompt);
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());
-    // IMPORTANT: stdin handling tied to an upstream quirk of
-    // `opencode run --attach`. With `Stdio::null()` it stops emitting
-    // events after `step_start`. With a pipe that never closes it waits
-    // for interactive input. The reliable shape is: open a pipe, write a
-    // single newline, then close — same as shell `echo | opencode run`.
+    // Piped-stdin + write "\n" + close matches shell `echo | opencode
+    // run`, which reliably makes opencode emit its NDJSON stream even
+    // for tiny prompts. `Stdio::null()` alone sometimes stops the
+    // stream after `step_start`.
     cmd.stdin(Stdio::piped());
 
     let mut child = cmd.spawn()
@@ -63,9 +58,6 @@ pub fn spawn_opencode_run(
 
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        // Fire-and-forget: write happens in a task, the pipe closes when
-        // the task ends. Errors are ignored — at worst we get the
-        // null-stdin failure mode which we'd already have without this.
         tokio::spawn(async move {
             let _ = stdin.write_all(b"\n").await;
             let _ = stdin.shutdown().await;

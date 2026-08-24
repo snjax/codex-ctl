@@ -1,5 +1,4 @@
 pub mod handler;
-pub mod opencode_server;
 pub mod server;
 
 use std::collections::HashMap;
@@ -7,23 +6,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
+use tokio::sync::RwLock;
+use tracing::info;
 
 use crate::client;
 use crate::session::Session;
-
-use opencode_server::OpencodeServer;
 
 /// The daemon managing all sessions.
 pub struct Daemon {
     pub sessions: HashMap<String, Arc<tokio::sync::Mutex<Session>>>,
     pub base_dir: PathBuf,
     pub sessions_dir: PathBuf,
-    /// Lazily-started persistent `opencode serve`. Created on first opencode
-    /// spawn, shared by all opencode sessions for the daemon's lifetime, and
-    /// killed in the SIGTERM hook.
-    pub opencode_server: Arc<Mutex<Option<OpencodeServer>>>,
 }
 
 impl Daemon {
@@ -36,31 +29,7 @@ impl Daemon {
             sessions: HashMap::new(),
             base_dir,
             sessions_dir,
-            opencode_server: Arc::new(Mutex::new(None)),
         })
-    }
-
-    pub fn opencode_pid_path(base_dir: &std::path::Path) -> PathBuf {
-        base_dir.join("opencode-server.pid")
-    }
-
-    /// Ensure the persistent opencode server is up and return its base URL.
-    /// Lazy-starts on first call; respawns if the prior child has died.
-    pub async fn ensure_opencode_server(&self, binary: &str) -> Result<String> {
-        let mut guard = self.opencode_server.lock().await;
-        if let Some(server) = guard.as_mut() {
-            if server.is_alive() {
-                return Ok(server.url.clone());
-            }
-            warn!("opencode server died; respawning");
-            // Drop the dead handle before starting a new one.
-            *guard = None;
-        }
-        let pid_path = Self::opencode_pid_path(&self.base_dir);
-        let server = OpencodeServer::start(binary, pid_path).await?;
-        let url = server.url.clone();
-        *guard = Some(server);
-        Ok(url)
     }
 
     /// Run the daemon: set up logging, write PID, start server.
@@ -85,9 +54,27 @@ impl Daemon {
         std::fs::write(&pid_path, std::process::id().to_string())?;
         info!("Daemon started, PID {}", std::process::id());
 
-        // Reap an orphaned opencode server left by a previous crashed
-        // daemon — must run after tracing is up so the audit line lands.
-        opencode_server::cleanup_stale(&Self::opencode_pid_path(&base_dir));
+        // Sweep any lingering `opencode serve` orphan from a previous
+        // daemon revision that maintained a persistent server (removed —
+        // upstream #31109 is fixed and `--attach` in 1.18.x drops events
+        // on stdout, so short-lived `opencode run` per turn is now more
+        // reliable). Best-effort: kill by pidfile if present, then unlink.
+        let opencode_pid_path = base_dir.join("opencode-server.pid");
+        if let Ok(pid_str) = std::fs::read_to_string(&opencode_pid_path) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                let cmdline_path = format!("/proc/{pid}/cmdline");
+                if let Ok(cmdline) = std::fs::read(&cmdline_path) {
+                    if cmdline.windows(b"opencode".len()).any(|w| w == b"opencode") {
+                        info!("Reaping orphaned opencode server pid={pid} (persistent-server mode removed)");
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::Signal::SIGTERM,
+                        );
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(&opencode_pid_path);
+        }
 
         // Remove stale socket
         let sock_path = client::socket_path();
@@ -126,15 +113,6 @@ impl Daemon {
                     let _ = nix::sys::signal::kill(session.pid, nix::sys::signal::Signal::SIGTERM);
                     session.mark_dead(None);
                 }
-            }
-
-            // Tear down persistent opencode server, if we started one.
-            let server_handle = {
-                let mut guard = daemon.opencode_server.lock().await;
-                guard.take()
-            };
-            if let Some(server) = server_handle {
-                server.shutdown().await;
             }
 
             // Clean up files
