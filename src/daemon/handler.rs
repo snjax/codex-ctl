@@ -442,10 +442,48 @@ async fn opencode_run_loop(
     let result = crate::session::opencode::consume_events(&mut child, &session).await;
 
     match result {
-        Ok((oc_sid, exit_code)) => {
+        Ok(outcome) => {
             let mut s = session.lock().await;
-            if let Some(sid) = oc_sid {
+            if let Some(sid) = outcome.session_id {
                 s.opencode_session_id = Some(sid);
+            }
+
+            let exit_code = outcome.exit_code;
+            let failed_hard = !outcome.saw_output
+                && (outcome.error.is_some()
+                    || !outcome.stderr.trim().is_empty()
+                    || exit_code.is_some_and(|c| c != 0));
+
+            // A run that produced nothing and failed used to land in
+            // `idle` with an empty log, indistinguishable from success.
+            // Record why it failed and mark it dead so callers waiting on
+            // state see the failure instead of a phantom completion.
+            if failed_hard {
+                let reason = outcome
+                    .error
+                    .clone()
+                    .or_else(|| {
+                        let e = outcome.stderr.trim();
+                        (!e.is_empty()).then(|| strip_ansi(e))
+                    })
+                    .unwrap_or_else(|| format!("opencode exited with code {exit_code:?}"));
+
+                let msg = crate::log::LogMessage::status(
+                    s.next_seq,
+                    format!("[opencode failed] {reason}"),
+                );
+                s.next_seq += 1;
+                let _ = s.log_writer.append_message(&msg);
+
+                error!("OpenCode session {} failed: {reason}", s.id);
+                s.mark_dead(exit_code.or(Some(1)));
+                return;
+            }
+
+            // A non-fatal error mid-run still gets recorded, but the
+            // session stays usable for `act`.
+            if let Some(ref e) = outcome.error {
+                warn!("OpenCode session {} reported an error: {e}", s.id);
             }
 
             // Transition to idle (not dead — opencode sessions can continue)
@@ -1139,6 +1177,13 @@ async fn handle_gui(
     }
 }
 
+/// Strip ANSI escape sequences. opencode colorizes its stderr, and those
+/// escapes would otherwise be written verbatim into the session log.
+fn strip_ansi(s: &str) -> String {
+    let re = Regex::new(r"\x1b\[[0-9;?]*[a-zA-Z]").unwrap();
+    re.replace_all(s, "").trim().to_string()
+}
+
 /// Scan screen lines for codex session UUID in "codex resume <UUID>" pattern.
 fn scan_for_codex_session_id(lines: &[String]) -> Option<String> {
     let re = Regex::new(r"codex resume ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})").unwrap();
@@ -1376,8 +1421,12 @@ async fn kill_opencode_session(
     let mut s = session.lock().await;
     if s.state == SessionState::Dead {
         return ok_json(serde_json::json!({
+            // Mirrored into `codex_session_id` so the backend-agnostic
+            // `kill | jq -r .codex_session_id` resume workflow yields a
+            // real id instead of the literal string "null", which was
+            // then passed back to `--resume` as a bogus session.
+            "codex_session_id": s.opencode_session_id,
             "ok": true,
-            "codex_session_id": serde_json::Value::Null,
             "opencode_session_id": s.opencode_session_id,
         }));
     }
@@ -1387,7 +1436,7 @@ async fn kill_opencode_session(
 
     ok_json(serde_json::json!({
         "ok": true,
-        "codex_session_id": serde_json::Value::Null,
+        "codex_session_id": oc_sid,
         "opencode_session_id": oc_sid,
     }))
 }

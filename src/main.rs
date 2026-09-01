@@ -543,6 +543,94 @@ fn resolve_backend_binary(backend: protocol::Backend) -> Result<String, String> 
         .map_err(|e| format!("Cannot find '{name}' in PATH ({e}). Set ${env_var}."))
 }
 
+/// Resolve a user-supplied opencode model id against `opencode models`.
+///
+/// opencode requires the fully-qualified `<provider>/<model>` id, and a
+/// wrong one is rejected server-side with an opaque "Unexpected server
+/// error" rather than a useful message. Short forms are common (`zai`
+/// for the `zai-coding-plan` provider), so accept them when they resolve
+/// to exactly one real model, and fail loudly at spawn time otherwise
+/// instead of handing opencode an id it cannot use.
+///
+/// Returns the id to pass through, or an error listing the candidates.
+fn resolve_opencode_model(binary: &str, model: &str) -> Result<String, String> {
+    let out = std::process::Command::new(binary).arg("models").output();
+
+    // If we can't enumerate models, don't block the spawn — pass through
+    // and let opencode have the final say.
+    let Ok(out) = out else { return Ok(model.to_string()) };
+    if !out.status.success() {
+        return Ok(model.to_string());
+    }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let known: Vec<&str> = listing
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && l.contains('/'))
+        .collect();
+    if known.is_empty() {
+        return Ok(model.to_string());
+    }
+
+    if known.iter().any(|k| *k == model) {
+        return Ok(model.to_string());
+    }
+
+    // Split on the LAST slash: providers themselves may contain slashes
+    // (e.g. `openrouter/z-ai/glm-5.3`).
+    let split = |id: &str| -> (String, String) {
+        match id.rsplit_once('/') {
+            Some((p, m)) => (p.to_string(), m.to_string()),
+            None => (String::new(), id.to_string()),
+        }
+    };
+    // Compare providers ignoring separators so `zai` matches
+    // `zai-coding-plan` but not `openrouter/z-ai`.
+    let norm = |s: &str| -> String {
+        s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
+    };
+
+    let (want_provider, want_model) = split(model);
+    let matches: Vec<&str> = known
+        .iter()
+        .copied()
+        .filter(|k| {
+            let (kp, km) = split(k);
+            km == want_model
+                && (want_provider.is_empty() || norm(&kp).starts_with(&norm(&want_provider)))
+        })
+        .collect();
+
+    match matches.len() {
+        1 => {
+            let resolved = matches[0].to_string();
+            eprintln!("note: model '{model}' resolved to '{resolved}'");
+            Ok(resolved)
+        }
+        0 => {
+            let near: Vec<&str> = known
+                .iter()
+                .copied()
+                .filter(|k| split(k).1 == want_model)
+                .collect();
+            if near.is_empty() {
+                Err(format!(
+                    "unknown opencode model '{model}'. Run `{binary} models` to list valid ids."
+                ))
+            } else {
+                Err(format!(
+                    "unknown opencode model '{model}'. Did you mean: {}?",
+                    near.join(", ")
+                ))
+            }
+        }
+        _ => Err(format!(
+            "ambiguous opencode model '{model}' — matches: {}. Use the full id.",
+            matches.join(", ")
+        )),
+    }
+}
+
 fn build_request(command: Commands) -> protocol::Request {
     match command {
         Commands::Spawn { prompt, cwd, gui, resume, opencode, kimi, model } => {
@@ -564,6 +652,19 @@ fn build_request(command: Commands) -> protocol::Request {
                     eprintln!("error: {msg}");
                     std::process::exit(1);
                 }
+            };
+            // `--model` only applies to opencode; other backends ignore it.
+            let model = match (backend, model) {
+                (protocol::Backend::Opencode, Some(m)) => {
+                    match resolve_opencode_model(&binary_path, &m) {
+                        Ok(resolved) => Some(resolved),
+                        Err(msg) => {
+                            eprintln!("error: {msg}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                (_, m) => m,
             };
             protocol::Request::Spawn { binary_path, prompt, cwd, gui, resume, backend, model }
         }

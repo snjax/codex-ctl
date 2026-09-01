@@ -46,7 +46,11 @@ pub fn spawn_opencode_run(
     cmd.arg(prompt);
 
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
+    // Captured, not discarded: opencode reports fatal startup failures
+    // ("Session not found", auth/config errors) only on stderr, and a
+    // discarded stderr turned every one of them into a silent empty
+    // session that looked like a successful no-op run.
+    cmd.stderr(Stdio::piped());
     // Piped-stdin + write "\n" + close matches shell `echo | opencode
     // run`, which reliably makes opencode emit its NDJSON stream even
     // for tiny prompts. `Stdio::null()` alone sometimes stops the
@@ -67,22 +71,58 @@ pub fn spawn_opencode_run(
     Ok(child)
 }
 
+/// What a single `opencode run` produced. Carries enough detail for the
+/// caller to tell a clean completion from a failure that produced no
+/// output at all, which previously both looked like "idle, empty log".
+pub struct RunOutcome {
+    pub session_id: Option<String>,
+    pub exit_code: Option<i32>,
+    /// Message from an `{"type":"error"}` NDJSON event, if any.
+    pub error: Option<String>,
+    /// Whatever opencode wrote to stderr (fatal startup errors land here).
+    pub stderr: String,
+    /// True if the model produced any text or tool activity.
+    pub saw_output: bool,
+}
+
 /// Translate opencode NDJSON events from a running child process,
 /// writing log messages and blocks to the session log.
 ///
 /// Locks the session mutex per-event to write to the log.
-///
-/// Returns `(opencode_session_id, exit_code)`.
 pub async fn consume_events(
     child: &mut Child,
     session: &tokio::sync::Mutex<super::Session>,
-) -> Result<(Option<String>, Option<i32>)> {
+) -> Result<RunOutcome> {
     let stdout = child.stdout.take()
         .context("No stdout on opencode child")?;
+
+    // Drain stderr concurrently so a chatty failure can't fill the pipe
+    // buffer and deadlock the stdout reader.
+    let stderr_task = child.stderr.take().map(|stderr| {
+        tokio::spawn(async move {
+            let mut buf = String::new();
+            let mut rdr = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match rdr.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if buf.len() < 8192 {
+                            buf.push_str(&line);
+                        }
+                    }
+                }
+            }
+            buf
+        })
+    });
 
     let mut reader = BufReader::new(stdout);
     let mut line_buf = String::new();
     let mut opencode_session_id: Option<String> = None;
+    let mut error: Option<String> = None;
+    let mut saw_output = false;
 
     loop {
         line_buf.clear();
@@ -110,6 +150,38 @@ pub async fn consume_events(
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let part = event.get("part").cloned().unwrap_or_default();
 
+        // Errors arrive as their own top-level event with no `part`, so
+        // they never reached `process_event`'s match and were dropped —
+        // an unusable model or a server-side failure produced a session
+        // that just went idle with an empty log. Surface them instead.
+        if event_type == "error" {
+            let err = event.get("error").cloned().unwrap_or_default();
+            let name = err.get("name").and_then(|v| v.as_str()).unwrap_or("Error");
+            let message = err
+                .get("data")
+                .and_then(|d| d.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let text = if message.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}: {message}")
+            };
+
+            let mut s = session.lock().await;
+            let msg = LogMessage::status(s.next_seq, format!("[opencode error] {text}"));
+            s.next_seq += 1;
+            let _ = s.log_writer.append_message(&msg);
+            drop(s);
+
+            error = Some(text);
+            continue;
+        }
+
+        if event_type == "text" || event_type == "tool_use" {
+            saw_output = true;
+        }
+
         // Lock session, process event, unlock
         let mut s = session.lock().await;
         process_event(event_type, &part, &mut s);
@@ -119,7 +191,18 @@ pub async fn consume_events(
     let status = child.wait().await?;
     let exit_code = status.code();
 
-    Ok((opencode_session_id, exit_code))
+    let stderr = match stderr_task {
+        Some(t) => t.await.unwrap_or_default(),
+        None => String::new(),
+    };
+
+    Ok(RunOutcome {
+        session_id: opencode_session_id,
+        exit_code,
+        error,
+        stderr,
+        saw_output,
+    })
 }
 
 /// Process a single NDJSON event, writing to the session log.
